@@ -1,7 +1,7 @@
 //! The Sideband mark.
 //!
 //! A sideband is the band of frequencies beside a carrier wave, and
-//! single-sideband radio transmits one of them and suppresses the rest — a
+//! single-sideband radio transmits one of them and suppresses the rest, a
 //! narrow, point-to-point signal with everything else left out. That is what
 //! this software does with a desktop, so that is what the mark draws: a tall
 //! carrier, two bands falling away to the right, and the pair on the left
@@ -9,7 +9,7 @@
 //!
 //! It is described as geometry rather than kept as a file. The window icon,
 //! the executable's icon and every size in between are rasterised from these
-//! numbers, so they cannot drift apart — `build.rs` includes this same source
+//! numbers, so they cannot drift apart, `build.rs` includes this same source
 //! to generate the `.ico`, which is why nothing here may depend on anything
 //! outside `core`.
 
@@ -24,7 +24,7 @@ pub const AMBER: [u8; 3] = [0xf0, 0xa9, 0x3b];
 /// The ground it sits on.
 pub const TILE: [u8; 3] = [0x14, 0x18, 0x1d];
 
-/// Corner radius of the tile, in grid units — the proportion Windows and
+/// Corner radius of the tile, in grid units, the proportion Windows and
 /// macOS both round application icons to.
 const TILE_RADIUS: f32 = 114.0;
 
@@ -35,7 +35,7 @@ pub struct Bar {
     pub w: f32,
     pub h: f32,
     /// How much of the signal reaches this band. The suppressed pair is drawn
-    /// in the same amber, simply attenuated — one hue, not two.
+    /// in the same amber, simply attenuated, one hue, not two.
     pub alpha: f32,
 }
 
@@ -85,7 +85,7 @@ pub fn bars(size: u32) -> &'static [Bar] {
 const SAMPLES: u32 = 4;
 
 /// The mark on its tile, as straight (non-premultiplied) RGBA, row-major from
-/// the top left — the layout both `egui` and the ICO format want.
+/// the top left, the layout both `egui` and the ICO format want.
 pub fn rgba(size: u32) -> Vec<u8> {
     let bars = bars(size);
     let scale = GRID / size as f32;

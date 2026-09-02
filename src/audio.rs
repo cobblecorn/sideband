@@ -1,4 +1,4 @@
-//! Stage 4b — Opus.
+//! Stage 4b, Opus.
 //!
 //! `rusty-opus` is a pure-Rust implementation, which after the NVENC episode is
 //! worth calling out: it pulls in no C toolchain, no vendored source tree, and
@@ -12,7 +12,7 @@
 //! Timestamps come from the running sample count rather than a wall clock, and
 //! that is only correct because `loopback::Capture::pump` gap-fills silence.
 //! Because the sample stream is continuous by construction, counting samples
-//! *is* counting time — and it cannot drift the way repeatedly reading a clock
+//! *is* counting time, and it cannot drift the way repeatedly reading a clock
 //! would.
 
 use rusty_opus::{Application, OpusEncoder};
@@ -41,7 +41,7 @@ pub struct OpusStream {
     enc: OpusEncoder,
     /// Interleaved samples not yet forming a whole frame.
     residue: Vec<f32>,
-    /// Frames emitted so far — the clock.
+    /// Frames emitted so far, the clock.
     frames_emitted: u64,
     bytes: u64,
     scratch: Vec<u8>,
@@ -66,7 +66,7 @@ impl OpusStream {
         enc.use_inband_fec = true;
 
         // DTX would emit 1-byte packets during silence. That directly undoes
-        // the gap-filling in loopback.rs — the whole point of which is a
+        // the gap-filling in loopback.rs, the whole point of which is a
         // continuous, evenly-paced stream. Off.
         enc.use_dtx = false;
 
@@ -108,7 +108,7 @@ impl OpusStream {
     }
 
     /// Samples buffered but not yet forming a whole frame. Never more than one
-    /// frame's worth. Diagnostic — the framing tests assert on it.
+    /// frame's worth. Diagnostic, the framing tests assert on it.
     #[allow(dead_code)]
     pub fn pending_samples(&self) -> usize {
         self.residue.len()
@@ -148,7 +148,7 @@ mod tests {
 
     const FRAME_LEN: usize = FRAME_SAMPLES * CHANNELS;
 
-    /// A quiet tone — real signal, so the encoder has something to chew on.
+    /// A quiet tone, real signal, so the encoder has something to chew on.
     fn tone(samples: usize) -> Vec<i16> {
         (0..samples)
             .map(|i| {
@@ -180,7 +180,7 @@ mod tests {
         assert!(packets.is_empty(), "half a frame should emit nothing");
         assert_eq!(s.pending_samples(), FRAME_LEN / 2);
 
-        // The other half completes it — nothing was lost across the boundary.
+        // The other half completes it, nothing was lost across the boundary.
         let packets = s.push(&tone(FRAME_LEN / 2)).unwrap();
         assert_eq!(packets.len(), 1);
         assert_eq!(s.pending_samples(), 0);

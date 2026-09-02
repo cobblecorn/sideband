@@ -39,13 +39,13 @@ const REFRESH_EVERY: Duration = Duration::from_secs(2);
 
 /// The strip's two heights. A dropdown has nowhere to go in a window this
 /// short, so choosing a source grows the window instead and it snaps back
-/// afterwards — the thin shape is the point, and it should only be given up
+/// afterwards, the thin shape is the point, and it should only be given up
 /// for the one moment it genuinely gets in the way.
 const HEIGHT_STRIP: f32 = 142.0;
 const HEIGHT_PICKING: f32 = 420.0;
 
 /// Width is the user's to choose; height is not. Pinning min and max height
-/// together means the bottom edge cannot be dragged at all — there is nothing
+/// together means the bottom edge cannot be dragged at all, there is nothing
 /// below the strip to reveal, so letting it stretch only ever produced a band
 /// of empty background.
 const MIN_WIDTH: f32 = 840.0;
@@ -245,7 +245,7 @@ impl eframe::App for App {
 
         // Height is enforced here rather than left to the window manager.
         // `with_max_inner_size` is only a hint, and on Windows it is not
-        // honoured — the bottom edge drags freely and leaves a band of empty
+        // honoured, the bottom edge drags freely and leaves a band of empty
         // background under the strip, because there is nothing below it to
         // reveal. Correcting the size each frame is what actually holds it.
         let wanted_height = if self.picking { HEIGHT_PICKING } else { HEIGHT_STRIP };
@@ -260,7 +260,7 @@ impl eframe::App for App {
             let width = viewport.width().clamp(MIN_WIDTH, MAX_WIDTH);
 
             // Raise the ceiling before asking for the new size, then lower the
-            // floor after — the other order clamps the request against limits
+            // floor after, the other order clamps the request against limits
             // that still describe the previous mode.
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(egui::vec2(
                 MAX_WIDTH,
@@ -360,7 +360,7 @@ impl App {
 
                         // Only when the viewer's connection has actually
                         // forced something down. At full quality this would be
-                        // a number saying "normal", which is noise — and a
+                        // a number saying "normal", which is noise, and a
                         // notice below is more urgent than either.
                         if sess.notice().is_none() {
                             if let Some(note) = throttle_note(sess) {
@@ -377,7 +377,7 @@ impl App {
                 }
             }
 
-            // Something the engine could not do — most often an application
+            // Something the engine could not do, most often an application
             // that refused to be captured when it was picked. It expires on
             // its own; a permanent banner for a transient problem would be
             // worse than not saying anything.
@@ -437,7 +437,7 @@ impl App {
     }
 
     /// Allow or refuse a viewer. Deliberately not defaulted either way and
-    /// deliberately not dismissible by clicking elsewhere — this is the one
+    /// deliberately not dismissible by clicking elsewhere, this is the one
     /// point where a person, rather than a secret, decides.
     fn approval_prompt(&mut self, ui: &mut egui::Ui, viewer: &str) {
         let session = self.session.clone();
@@ -505,20 +505,19 @@ impl App {
         caption(ui, "APPLICATION");
 
         // The picker stays live while streaming. Swapping what you are
-        // sharing mid-call is the ordinary case — the viewer keeps the same
+        // sharing mid-call is the ordinary case, the viewer keeps the same
         // connection, the same code, and simply sees something else.
         //
         // While running the name comes from the session rather than from the
         // window list, because the list is refreshed on its own timer and a
         // moment where it does not yet contain the running source should not
         // make the strip read "Choose an application".
-        let live_name = self
+        let (live_exe, live_title) = self
             .session
             .as_ref()
             .filter(|_| running)
             .map(|s| s.source())
             .unwrap_or_default();
-        let (live_exe, live_title) = split_source(&live_name);
 
         let chosen = running || self.selected.is_some();
         let label = if running {
@@ -650,7 +649,7 @@ impl App {
             let mic_on = session.as_ref().is_some_and(|s| s.mic_on());
             let mic_ok = session.as_ref().is_some_and(|s| s.mic_available());
             if pill(ui, "mic", mic_on, live && mic_ok)
-                .on_hover_text(format!("microphone \u{2014} {}", hotkey::DESCRIPTION))
+                .on_hover_text(format!("microphone - {}", hotkey::DESCRIPTION))
                 .clicked()
             {
                 if let Some(s) = &session {
@@ -744,7 +743,7 @@ impl App {
 /// while that is below full quality.
 ///
 /// At the ceiling this would be a number meaning "normal", which is noise. Below
-/// it, it is the answer to the only question a softer picture raises — whether
+/// it, it is the answer to the only question a softer picture raises, whether
 /// the software is doing something wrong, or the viewer's connection cannot
 /// take more.
 fn throttle_note(session: &Session) -> Option<String> {
@@ -965,13 +964,6 @@ fn shorten_url(url: &str) -> String {
     truncate(bare, 32)
 }
 
-fn split_source(s: &str) -> (String, String) {
-    match s.split_once(" \u{2014} ") {
-        Some((exe, rest)) => (exe.to_owned(), rest.to_owned()),
-        None => (s.to_owned(), String::new()),
-    }
-}
-
 /// One row of the expanded list, drawn by hand so the text can be left-aligned
 /// and two-line without fighting the button widget's centring.
 fn source_row(
@@ -1063,7 +1055,7 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{masked, shorten_url, spaced, split_source, truncate};
+    use super::{masked, shorten_url, spaced, truncate};
 
     #[test]
     fn hidden_codes_reveal_nothing_but_keep_their_width() {
@@ -1084,17 +1076,6 @@ mod tests {
         let out = shorten_url("https://sideband.example.workers.dev/ABC234");
         assert!(!out.starts_with("https://"));
         assert!(out.starts_with("sideband."));
-    }
-
-    #[test]
-    fn source_splits_on_the_separator_it_was_built_with() {
-        let (exe, title) = split_source("Overwatch.exe \u{2014} Overwatch");
-        assert_eq!(exe, "Overwatch.exe");
-        assert_eq!(title, "Overwatch");
-
-        let (exe, title) = split_source("solo.exe");
-        assert_eq!(exe, "solo.exe");
-        assert!(title.is_empty());
     }
 
     #[test]

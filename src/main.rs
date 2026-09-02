@@ -1,11 +1,11 @@
-// A GUI app, so Windows does not hand it a console window on launch — an
+// A GUI app, so Windows does not hand it a console window on launch, an
 // empty black box appearing behind the strip looks broken even though nothing
 // is wrong. The command-line modes still need somewhere to print, so when the
 // process was started from a terminal it borrows that terminal's console
 // instead of creating one. See `attach_parent_console`.
 #![windows_subsystem = "windows"]
 
-//! Sideband — stream one application, and only that application's audio,
+//! Sideband, stream one application, and only that application's audio,
 //! to one person in a browser.
 //!
 //! Run with no arguments for the window; every command-line mode is listed in
@@ -54,7 +54,7 @@ fn main() {
 ///
 /// A `windows` subsystem binary has no console of its own, so `println!` would
 /// otherwise go nowhere when run from a terminal. This does not create a
-/// console — if the process was started from Explorer there is nothing to
+/// console, if the process was started from Explorer there is nothing to
 /// attach to and the call simply fails, which is the behaviour we want.
 fn attach_parent_console() {
     use windows::Win32::System::Console::{
@@ -68,7 +68,7 @@ fn attach_parent_console() {
     }
 
     // Re-open only the streams that have nowhere to go. If stdout was already
-    // redirected — piped into another command, or captured to a file — then
+    // redirected, piped into another command, or captured to a file, then
     // pointing it at the console would silently steal that output, which
     // breaks every script that reads from us.
     unsafe {
@@ -156,7 +156,7 @@ fn run() -> Result<(), String> {
                 Some(a) => parse_pid(a)?,
                 None => pick_source()?,
             };
-            // Explicit argument first, then whatever the window last used —
+            // Explicit argument first, then whatever the window last used,
             // which is also where SIDEBAND_RELAY lands. One relay, however you
             // told it.
             let relay = match args.get(2) {
@@ -165,7 +165,7 @@ fn run() -> Result<(), String> {
                     let remembered = settings::Settings::load().relay;
                     if remembered.is_empty() {
                         return Err(
-                            "no relay given — pass one, set SIDEBAND_RELAY, or enter one in the window"
+                            "no relay given - pass one, set SIDEBAND_RELAY, or enter one in the window"
                                 .into(),
                         );
                     }
@@ -427,7 +427,7 @@ fn pick_source() -> Result<u32, String> {
     Ok(list[idx - 1].pid)
 }
 
-/// Stage 4 — the full video path: capture a window, pace it to a steady
+/// Stage 4, the full video path: capture a window, pace it to a steady
 /// cadence, encode with NVENC, write raw H.264. Play the result with
 /// `ffplay out.h264`, or just check it decodes.
 fn encode_window(pid: u32, seconds: f64) -> Result<(), String> {
@@ -451,7 +451,7 @@ fn encode_window(pid: u32, seconds: f64) -> Result<(), String> {
     const FPS: u32 = 60;
     const BITRATE: u32 = 10_000_000;
 
-    // Halfway through, the encoder is retuned in place — the same call the
+    // Halfway through, the encoder is retuned in place, the same call the
     // rate controller makes when a viewer's connection cannot keep up. It is
     // exercised here because a driver that quietly refuses it would leave
     // adaptation doing nothing at all, and nothing else would say so.
@@ -522,7 +522,7 @@ fn encode_window(pid: u32, seconds: f64) -> Result<(), String> {
                             e.fps()
                         );
                     }
-                    Err(err) => println!("  retune      REFUSED — {err}"),
+                    Err(err) => println!("  retune      REFUSED - {err}"),
                 }
             }
         }
@@ -571,7 +571,7 @@ fn encode_window(pid: u32, seconds: f64) -> Result<(), String> {
     Ok(())
 }
 
-/// Stage 2 — pull frames off a window for `seconds` and report the rate.
+/// Stage 2, pull frames off a window for `seconds` and report the rate.
 /// Saves one frame as a BMP so there is something to actually look at.
 fn capture_window(pid: u32, seconds: f64) -> Result<(), String> {
     let src = sources::list()
@@ -627,7 +627,7 @@ fn capture_window(pid: u32, seconds: f64) -> Result<(), String> {
     }
 
     let elapsed = start.elapsed().as_secs_f64();
-    println!("  {} frames in {:.1}s — {:.1} fps", frames, elapsed, frames as f64 / elapsed);
+    println!("  {} frames in {:.1}s - {:.1} fps", frames, elapsed, frames as f64 / elapsed);
     println!("  frame size {}x{}", dims.0, dims.1);
     if saved {
         println!("  wrote {}\n", out.display());
@@ -686,7 +686,7 @@ fn capture(pid: u32, exe: &str, seconds: Option<f64>) -> Result<(), String> {
     println!();
 
     if silence > 0.95 {
-        println!("  Nearly all silence — either the app made no sound, or its audio");
+        println!("  Nearly all silence - either the app made no sound, or its audio");
         println!("  comes from a process outside the tree. Try picking a different");
         println!("  window belonging to the same app.\n");
     }

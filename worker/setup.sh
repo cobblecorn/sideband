@@ -24,7 +24,7 @@ account=$(npx --yes wrangler whoami 2>/dev/null | grep -oE '[A-Za-z0-9._%+-]+@[A
 say "Signed in${account:+ as $account}."
 
 # ---------------------------------------------------------------------------
-# 2. KV namespace — the relay's only storage. Two writes per session.
+# 2. KV namespace, the relay's only storage. Two writes per session.
 # ---------------------------------------------------------------------------
 current_id=$(grep -oE '^id = "([^"]*)"' wrangler.toml | sed 's/id = "//; s/"//')
 
@@ -51,7 +51,7 @@ if [ "$current_id" = "PASTE_NAMESPACE_ID_HERE" ] || [ -z "$current_id" ]; then
     && mv wrangler.toml.new wrangler.toml
   say "Namespace created and written to wrangler.toml."
 else
-  say "Namespace already configured ($current_id) — leaving it alone."
+  say "Namespace already configured ($current_id), leaving it alone."
 fi
 
 # ---------------------------------------------------------------------------

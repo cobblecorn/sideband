@@ -11,7 +11,7 @@
 //! slot-skipping then absorbs the catch-up cleanly.
 //!
 //! Nothing here prints. Progress goes into `Session`, and the window or the
-//! terminal renders it — which is what lets one engine back both.
+//! terminal renders it, which is what lets one engine back both.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,7 +26,7 @@ use crate::session::{Phase, Session};
 use crate::{bwe, capture, encoder, hotkey, loopback, mic, net, pipeline, server, sources};
 
 /// The fastest we ever capture or send. The rate controller may settle below
-/// this — see `bwe` — but never above it, because the source cannot produce
+/// this, see `bwe`, but never above it, because the source cannot produce
 /// more and a browser gains nothing from being told otherwise.
 const FPS: u32 = 60;
 
@@ -43,14 +43,14 @@ const CONTROL_INTERVAL: Duration = Duration::from_secs(1);
 /// on a 1080p60 game source, a 2-second IDR gave 9.7 fps decoded with 3.8
 /// picture-loss requests per second, while the identical stream with no
 /// periodic IDR gave 64 fps and zero. Two separate causes were fixed along the
-/// way — repeated parameter sets (see `encoder::strip_parameter_sets`) and a
-/// one-frame VBV budget — and neither accounted for it. The remaining fault is
+/// way, repeated parameter sets (see `encoder::strip_parameter_sets`) and a
+/// one-frame VBV budget, and neither accounted for it. The remaining fault is
 /// in how the library packetises a forced IDR, and a "safety net" that costs
 /// six sevenths of the frame rate is not a safety net.
 ///
 /// Loss recovery does not depend on this. The default interceptors run a NACK
 /// responder that buffers outgoing RTP and retransmits it on request, which is
-/// what repairs ordinary packet loss — keyframes are only needed for loss too
+/// what repairs ordinary packet loss, keyframes are only needed for loss too
 /// large to retransmit through, and a viewer in that position can reload the
 /// page for a fresh session.
 ///
@@ -107,7 +107,7 @@ fn describe_source(pid: u32, session: &Session) -> Result<(), String> {
     session.set_source(&src.exe, &src.title);
 
     // From here the session, not this argument, is what says which
-    // application is being shared — so that it can be changed later without
+    // application is being shared, so that it can be changed later without
     // taking the connection down.
     session.select_source(pid);
     Ok(())
@@ -172,7 +172,7 @@ async fn serve_relay(pid: u32, relay: String, session: Arc<Session>) -> Result<(
     session.preparing("starting up");
 
     // The relay issues the code and a secret token. The host cannot choose its
-    // own code — that would let one be squatted, and would leave the relay
+    // own code, that would let one be squatted, and would leave the relay
     // nothing to attach a per-client limit to.
     let ticket = create_session(&relay).await?;
     let link = format!("{relay}/{}", ticket.code);
@@ -192,7 +192,7 @@ async fn relay_attempts(
 ) -> Result<(), String> {
     for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
-            session.preparing("that attempt did not connect — offering again");
+            session.preparing("that attempt did not connect - offering again");
         }
 
         let webrtc = net::connect(net::ice_servers()).await?;
@@ -239,7 +239,7 @@ async fn relay_attempts(
 /// What the relay hands back when a session is created.
 struct Ticket {
     code: String,
-    /// Proves we are the host. Never shown, never spoken, never in a URL —
+    /// Proves we are the host. Never shown, never spoken, never in a URL,
     /// only this process and the relay ever hold it.
     token: String,
 }
@@ -346,7 +346,7 @@ async fn destroy_session(relay: &str, ticket: &Ticket) {
 ///
 /// A denial ends the session rather than going back to waiting. The code has
 /// already been claimed at that point, and someone the host just refused is
-/// exactly the person who should not get another go at it — starting again
+/// exactly the person who should not get another go at it, starting again
 /// issues a fresh code.
 async fn approved(answer: &str, session: &Arc<Session>) -> bool {
     session.request_approval(&describe_viewer(answer));
@@ -391,7 +391,7 @@ fn describe_viewer(answer: &str) -> String {
     }
 
     // mDNS hides host candidates behind a random .local name, so falling back
-    // to one is often useless — say so rather than showing noise.
+    // to one is often useless, say so rather than showing noise.
     match host_candidate {
         Some(a) if !a.ends_with(".local") => a,
         _ => "address not shared".to_owned(),
@@ -402,7 +402,7 @@ fn describe_viewer(answer: &str) -> String {
 ///
 /// Off unless `SIDEBAND_DEBUG_RATE` is set. This exists because the connection
 /// that matters is somebody else's, on the other side of the internet, and
-/// cannot be reproduced here — when a stream misbehaves, this is the record of
+/// cannot be reproduced here, when a stream misbehaves, this is the record of
 /// whether the viewer was reporting loss, reporting a low estimate, or
 /// reporting nothing at all, which are three different problems.
 fn trace_rate(feedback: &bwe::Feedback, target: bwe::Target) {
@@ -483,13 +483,13 @@ async fn pump<P: webrtc::peer_connection::PeerConnection>(
         tokio::select! {
             Some((au, ts)) = video_rx.recv() => {
                 // While paused the channels are still drained, so capture does
-                // not block behind a full queue — the frames are simply not
+                // not block behind a full queue, the frames are simply not
                 // sent, and the viewer holds the last picture it decoded.
                 if !session.paused() {
                     let len = au.len();
                     // The frame duration follows whatever cadence the rate
                     // controller settled on, because it is what the RTP
-                    // timestamps are derived from — leaving it at the original
+                    // timestamps are derived from, leaving it at the original
                     // 60ths of a second while sending 30 would tell the viewer
                     // to play everything at double speed.
                     let frame_duration =
@@ -592,7 +592,7 @@ fn video_loop(
     }
 
     // The first source has to work. A session that opens with nothing on
-    // screen is a failure to report, not a state to recover from — unlike
+    // screen is a failure to report, not a state to recover from, unlike
     // every later source change, which is.
     let mut showing = session.selected_source();
     let mut cap = Some(open_source(showing, &session)?);
@@ -639,7 +639,7 @@ fn video_loop(
                         session.note(e);
                         if cap.is_some() {
                             // There is still a working source to stay on, so
-                            // put the choice back — the picker showing an
+                            // put the choice back, the picker showing an
                             // application that is not on screen would be a lie.
                             session.select_source(showing);
                         } else {
@@ -660,9 +660,9 @@ fn video_loop(
                 // The window closed, or the app did. This used to end the
                 // stream; now that another application can be chosen without
                 // reconnecting, holding the session open is the useful thing
-                // to do — the viewer keeps the last frame until there is
+                // to do, the viewer keeps the last frame until there is
                 // something new to show them.
-                session.note(format!("that window is gone ({e}) — pick another application"));
+                session.note(format!("that window is gone ({e}) - pick another application"));
                 drop(enc.take());
                 cap = None;
                 continue;
@@ -794,7 +794,7 @@ mod tests {
 
     #[test]
     fn local_address_is_usable_or_falls_back() {
-        // Either a real interface address, or localhost — never empty, since
+        // Either a real interface address, or localhost, never empty, since
         // it goes straight into a link a person has to type.
         let a = super::local_address();
         assert!(!a.is_empty());

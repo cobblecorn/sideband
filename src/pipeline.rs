@@ -1,4 +1,4 @@
-//! Stage 4, part one — the pacing spine the encoder plugs into.
+//! Stage 4, part one, the pacing spine the encoder plugs into.
 //!
 //! Two findings from stages 2 and 3 turn out to be the same bug wearing
 //! different hats:
@@ -16,7 +16,7 @@
 //! synthesising silence (see `loopback::Capture::pump`).
 //!
 //! `Pacer` is generic over the frame type purely so it can be tested without a
-//! GPU — in the real pipeline `T` is `ID3D11Texture2D`, which is a refcounted
+//! GPU, in the real pipeline `T` is `ID3D11Texture2D`, which is a refcounted
 //! COM pointer, so cloning it to repeat a frame is a refcount bump and not a
 //! copy of any pixels.
 
@@ -49,7 +49,7 @@ impl Default for MediaClock {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Paced<T> {
     pub frame: T,
-    /// Microseconds from the shared epoch. Evenly spaced by construction —
+    /// Microseconds from the shared epoch. Evenly spaced by construction,
     /// this is the slot time, not the wall-clock time the frame was emitted,
     /// so jitter in the caller's polling never reaches the encoder.
     pub timestamp_us: u64,
@@ -62,7 +62,7 @@ pub struct Pacer<T> {
     next_deadline_us: u64,
     last: Option<T>,
     /// Whether a new frame has arrived since the last emission. This is the
-    /// question the repeat statistic is actually asking — *not* whether a
+    /// question the repeat statistic is actually asking, *not* whether a
     /// frame happened to arrive on the same call as the deadline, which for
     /// any realistic polling interval is almost never true.
     fresh_since_emit: bool,
@@ -89,12 +89,12 @@ impl<T: Clone> Pacer<T> {
     /// Feed in whatever the source produced since the last call (`None` if it
     /// produced nothing) and get back a frame if one is due.
     ///
-    /// Safe to call as often as you like — it emits at most one frame per
+    /// Safe to call as often as you like, it emits at most one frame per
     /// call, on the deadline. Time is a parameter rather than read from a
     /// clock so this stays deterministic under test.
     pub fn tick_at(&mut self, now_us: u64, fresh: Option<T>) -> Option<Paced<T>> {
         // Newest wins: if the source produced several frames between
-        // deadlines, the intermediate ones are never sent. That is correct —
+        // deadlines, the intermediate ones are never sent. That is correct,
         // we are streaming current state, not recording every frame.
         if let Some(f) = fresh {
             self.last = Some(f);
@@ -105,7 +105,7 @@ impl<T: Clone> Pacer<T> {
             return None;
         }
 
-        // Nothing has ever arrived — there is no previous frame to repeat, so
+        // Nothing has ever arrived, there is no previous frame to repeat, so
         // hold the deadline rather than emitting garbage.
         let Some(frame) = self.last.clone() else {
             self.next_deadline_us = now_us + self.interval_us;
@@ -175,7 +175,7 @@ pub struct PacerStats {
 
 impl PacerStats {
     /// Share of emitted frames that were repeats. High is not automatically
-    /// bad — a paused game legitimately repeats — but a high figure during
+    /// bad, a paused game legitimately repeats, but a high figure during
     /// active play means frames are not arriving and something is wrong.
     pub fn repeat_ratio(&self) -> f64 {
         if self.delivered == 0 {
@@ -205,7 +205,7 @@ pub trait VideoEncoder {
 
 /// Implemented by the Opus encoder. PCM arrives already gap-filled, so the
 /// implementation derives timestamps from its own sample count rather than
-/// being told the time — counting a continuous stream cannot drift the way
+/// being told the time, counting a continuous stream cannot drift the way
 /// repeatedly reading a clock can.
 #[allow(dead_code)] // consumed generically once stage 5 owns the send loop
 pub trait AudioEncoder {
@@ -334,7 +334,7 @@ mod tests {
         p.set_fps(30);
         let slow = 1_000_000 / 30;
 
-        // The deadline already set stands — it is at most one frame away, and
+        // The deadline already set stands, it is at most one frame away, and
         // moving it would either drop a frame or emit two in a row.
         assert_eq!(p.tick_at(IVL, Some(2)).unwrap().timestamp_us, IVL);
         assert_eq!(p.tick_at(IVL + 1, Some(3)), None, "the next slot is further out now");

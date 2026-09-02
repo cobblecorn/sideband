@@ -2,7 +2,7 @@
 //!
 //! The whole point of this project is that the stream carries the game and
 //! nothing else. The mic is the one exception you actually want on purpose,
-//! so it is off by default and toggled with a global hotkey — you are in a
+//! so it is off by default and toggled with a global hotkey, you are in a
 //! game when you decide to use it, and alt-tabbing to click something defeats
 //! the purpose.
 //!
@@ -47,7 +47,7 @@ pub struct Mic {
 
 impl Mic {
     /// Opens the default capture device and starts buffering. Returns a Mic
-    /// with `available: false` rather than an error if there is no device —
+    /// with `available: false` rather than an error if there is no device,
     /// a missing microphone should not stop someone sharing their screen.
     pub fn start(stop: Arc<AtomicBool>) -> Self {
         let enabled = Arc::new(AtomicBool::new(false));
@@ -209,7 +209,7 @@ fn capture_loop(
                     .map_err(|e| format!("mic GetBuffer failed: {e}"))?;
 
                 // While muted the device is still drained, but nothing is
-                // kept — otherwise unmuting would replay a backlog.
+                // kept, otherwise unmuting would replay a backlog.
                 if enabled.load(Ordering::Relaxed) && !data.is_null() {
                     let samples = frames as usize * CHANNELS as usize;
                     let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;

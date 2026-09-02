@@ -1,4 +1,4 @@
-//! Stage 4, part two — NVENC, fed D3D11 textures directly.
+//! Stage 4, part two, NVENC, fed D3D11 textures directly.
 //!
 //! The crate we lean on here (`moq-nvenc`) is a fork of the mainline SDK
 //! bindings whose one relevant change is that it loads `nvEncodeAPI64.dll` at
@@ -8,7 +8,7 @@
 //! CUDA as the device type, so the session is opened against `sys` by hand.
 //!
 //! The zero-copy claim is real and worth protecting: WGC hands us a BGRA
-//! texture, and NVENC's `ARGB` buffer format is byte-order B,G,R,A — the same
+//! texture, and NVENC's `ARGB` buffer format is byte-order B,G,R,A, the same
 //! layout. No conversion pass, no shader, no readback. If anyone ever adds a
 //! CPU copy between capture and here, the latency budget is gone.
 
@@ -43,7 +43,7 @@ pub struct NvencEncoder {
     config: Box<NV_ENC_CONFIG>,
     init: Box<NV_ENC_INITIALIZE_PARAMS>,
     /// What the encoder is actually running at, and what was last asked for.
-    /// They differ when a driver refuses a rate change — which is worth being
+    /// They differ when a driver refuses a rate change, which is worth being
     /// able to see rather than assuming it took.
     applied: (u32, u32),
     attempted: (u32, u32),
@@ -96,7 +96,7 @@ fn split_nals(au: &[u8]) -> Vec<(usize, usize)> {
 /// time as a standalone NAL. The first keyframe survives that because the
 /// payloader's parameter-set state starts empty; every later one corrupts the
 /// stream, and the viewer's decoder stops decoding anything and asks for
-/// keyframes several times a second — which makes it worse, not better.
+/// keyframes several times a second, which makes it worse, not better.
 ///
 /// The receiver keeps the parameter sets it got from the first keyframe for
 /// the life of the session, so later IDRs decode without them. Each viewer
@@ -142,7 +142,7 @@ impl NvencEncoder {
             )?;
 
             // Start from the low-latency preset and adjust, rather than
-            // filling NV_ENC_CONFIG from scratch — the struct is large and
+            // filling NV_ENC_CONFIG from scratch, the struct is large and
             // most of it is not ours to have an opinion about.
             let mut preset = NV_ENC_PRESET_CONFIG {
                 version: NV_ENC_PRESET_CONFIG_VER,
@@ -180,7 +180,7 @@ impl NvencEncoder {
             // buffer is the lowest-latency choice, but it leaves no budget for
             // a keyframe: a forced 1080p IDR needs many times a normal frame's
             // bits, and squeezing it into one frame's allowance starves the
-            // frames that follow until the next IDR — which looks exactly like
+            // frames that follow until the next IDR, which looks exactly like
             // a decoder that cannot recover.
             //
             // A quarter-second buffer still keeps the encoder from banking
@@ -356,8 +356,8 @@ impl NvencEncoder {
     ///
     /// The encoder keeps going: no IDR is forced and no state is reset, which
     /// is the whole point. Rebuilding the session instead would emit a fresh
-    /// keyframe — a burst of exactly the size a congested link cannot absorb,
-    /// sent at the moment congestion was detected — and would need new
+    /// keyframe, a burst of exactly the size a congested link cannot absorb,
+    /// sent at the moment congestion was detected, and would need new
     /// parameter sets that `strip_parameter_sets` deliberately withholds.
     ///
     /// Resolution is not among the levers here, and cannot be until the

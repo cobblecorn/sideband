@@ -1,11 +1,11 @@
-//! Local signalling — no cloud involved.
+//! Local signalling, no cloud involved.
 //!
 //! Because the offer is non-trickle and self-contained, the whole handshake is
 //! two plain HTTP requests. That is small enough to hand-roll, which is why
 //! LAN and Tailscale need no Worker, no account and no infrastructure.
 //!
 //! It is still not open house. Being on the same network is not consent to
-//! watch someone's screen — a flatmate, a guest, or anything already running
+//! watch someone's screen, a flatmate, a guest, or anything already running
 //! on the machine could otherwise just open the port. So the link carries a
 //! secret, every route checks it, and the session can be claimed exactly once,
 //! matching what the relay enforces for internet pairing.
@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 
 const PAGE: &str = include_str!("client.html");
 
-/// 128 bits, hex. Never spoken aloud — it travels inside the link — so there
+/// 128 bits, hex. Never spoken aloud, it travels inside the link, so there
 /// is no reason to make it short enough to read out.
 pub fn make_secret() -> String {
     let bytes: [u8; 16] = rand::random();

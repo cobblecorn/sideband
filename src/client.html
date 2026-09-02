@@ -14,7 +14,7 @@
   #panel { text-align:center; }
   h1 { font-size:15px; font-weight:600; letter-spacing:.14em; text-transform:uppercase;
     color:#f0a93b; margin:0 0 6px; }
-  /* Geometry from src/mark.rs — the window icon and the executable's own
+  /* Geometry from src/mark.rs, the window icon and the executable's own
      icon are rasterised from the same numbers. */
   .mark { width:38px; height:38px; display:block; margin:0 auto 10px; }
   p { color:#98a4b1; margin:0 0 22px; }
@@ -150,7 +150,7 @@ async function connectWithRetry() {
       if (window.pc) { try { window.pc.close(); } catch (_) {} }
       const fatal = /already watching|not valid/.test(e.message);
       if (fatal || tryNo === 2) throw e;
-      say('That did not take — trying once more…');
+      say('That did not take - trying once more…');
       await new Promise((r) => setTimeout(r, 1500));
     }
   }

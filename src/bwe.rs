@@ -11,18 +11,18 @@
 //! browser sends two kinds of evidence back, and they answer different
 //! questions:
 //!
-//!   * **REMB** — the viewer watching packet arrival times and telling us, in
+//!   * **REMB**, the viewer watching packet arrival times and telling us, in
 //!     bits per second, what it thinks the path can carry. It notices a
 //!     filling queue *before* anything is lost, which is the only signal that
 //!     arrives in time to prevent the damage.
-//!   * **Receiver reports** — how many packets actually went missing. Slower
+//!   * **Receiver reports**, how many packets actually went missing. Slower
 //!     and after the fact, but it is ground truth, and it comes back from
 //!     every receiver including ones that never send REMB.
 //!
 //! Both arrive as RTCP, and this module reads them itself rather than through
 //! the library's statistics. That is not a preference. `rtc` 0.20.4 defines
 //! `process_read_rtcp_for_stats` and never calls it, and the innermost
-//! interceptor in the chain discards RTCP instead of forwarding it — so
+//! interceptor in the chain discards RTCP instead of forwarding it, so
 //! `get_stats` reports zero loss, zero NACKs and zero picture-loss requests no
 //! matter what the viewer sends. Believing those numbers would mean believing
 //! every connection is perfect, which is exactly the failure this module
@@ -45,7 +45,7 @@ use rtc::rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEs
 use rtc::rtcp::receiver_report::ReceiverReport;
 use rtc::rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack;
 // The interceptor macros expand to code that names `sansio::Protocol` by
-// path, so the module itself has to be in scope — importing the trait alone
+// path, so the module itself has to be in scope, importing the trait alone
 // is not enough.
 use rtc::sansio;
 use rtc::shared::error::Error;
@@ -54,7 +54,7 @@ use rtc::shared::error::Error;
 ///
 /// Not the maximum. Starting at the ceiling and waiting to be told to come
 /// down means the first thing a slow connection experiences is the failure
-/// this module exists to prevent — by the time the first receiver report
+/// this module exists to prevent, by the time the first receiver report
 /// arrives, a second of video has already been forced into a queue that could
 /// not hold it. Starting here and climbing costs a few soft seconds on a fast
 /// link and costs a slow one nothing.
@@ -64,7 +64,7 @@ pub const START_BITRATE: u32 = 2_500_000;
 /// cannot carry this much cannot carry a screen share at all.
 pub const MIN_BITRATE: u32 = 500_000;
 
-/// The ceiling — what a 1080p60 game source can actually use.
+/// The ceiling, what a 1080p60 game source can actually use.
 pub const MAX_BITRATE: u32 = 10_000_000;
 
 /// Loss above this is congestion and the rate comes down.
@@ -101,7 +101,7 @@ const MAX_DECREASE: f64 = 0.5;
 /// down and the estimate follows it down, so it can never show the headroom
 /// that would allow the rate back up. A stream that spent a while on a still
 /// window ends up pinned at the floor and stays there even once the picture is
-/// moving again — measured, and the reason this is a rate and not a target.
+/// moving again, measured, and the reason this is a rate and not a target.
 const ESTIMATE_HEADROOM: f64 = 1.05;
 
 /// How much a receiver's estimate has to fall before it counts as the
@@ -112,7 +112,7 @@ const ESTIMATE_DROP: f64 = 0.98;
 /// estimate is worth reading at all.
 ///
 /// The estimate is computed from the traffic that arrives, so it describes
-/// whatever is being sent — and when a still window is being sent, that is the
+/// whatever is being sent, and when a still window is being sent, that is the
 /// window, not the link. Below this line nothing about the path is being
 /// tested and no reading of the estimate is valid in either direction. Loss
 /// reports still are: loss is loss at any rate.
@@ -123,7 +123,7 @@ const PUSHING: f64 = 0.5;
 /// A cheap picture cannot use its budget, so the link is never tested at that
 /// rate and neither a quiet loss report nor a receiver estimate says anything
 /// about whether it could carry it. Letting the target climb anyway banks
-/// permission that was never earned — and spends it all at once the moment the
+/// permission that was never earned, and spends it all at once the moment the
 /// picture gets busy, which is the failure this whole module exists to
 /// prevent.
 const OVERSHOOT: f64 = 2.0;
@@ -148,7 +148,7 @@ const RAMP_MAX: f64 = 1.40;
 
 /// What to leave for audio when treating a receiver estimate as a ceiling.
 /// REMB covers everything on the transport, and the number we control is the
-/// video encoder's — spending the whole estimate on video would starve the
+/// video encoder's, spending the whole estimate on video would starve the
 /// audio it also has to cover. 128 kbit/s of Opus plus RTP overhead.
 const AUDIO_ALLOWANCE: u32 = 160_000;
 
@@ -231,7 +231,7 @@ impl ViewerFeedback {
     }
 
     /// Records one bandwidth estimate. If several arrive within an interval the
-    /// lowest wins — the cautious reading is the safe one.
+    /// lowest wins, the cautious reading is the safe one.
     fn note_estimate(&self, bits_per_second: u32) {
         // Zero is the sentinel for "nothing reported", so a genuine zero
         // estimate is stored as one bit per second rather than vanishing.
@@ -301,7 +301,7 @@ impl ViewerFeedback {
 ///
 /// It lives in the interceptor chain because that is the only place either
 /// direction is visible: outgoing RTP passes through on its way to the wire,
-/// and incoming RTCP passes through and then stops — the chain's innermost
+/// and incoming RTCP passes through and then stops, the chain's innermost
 /// layer drops it rather than handing it up. Nothing downstream can tell this
 /// layer is here.
 #[derive(Interceptor)]
@@ -309,9 +309,9 @@ pub struct FeedbackWatcher<P> {
     #[next]
     inner: P,
     feedback: ViewerFeedback,
-    /// Only the video stream is measured. Audio loss matters less — Opus
+    /// Only the video stream is measured. Audio loss matters less, Opus
     /// carries in-band FEC, and a lost 20 ms packet is a blip rather than a
-    /// broken reference chain — and folding the two together would let a
+    /// broken reference chain, and folding the two together would let a
     /// healthy audio stream mask a video stream in trouble.
     video_ssrc: u32,
 }
@@ -410,7 +410,7 @@ impl<P> FeedbackWatcher<P> {
 /// What the viewer told us about the last interval.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Feedback {
-    /// The worst loss fraction reported, 0.0–1.0.
+    /// The worst loss fraction reported, 0.0-1.0.
     ///
     /// `None` when no receiver report arrived, which is not the same as zero
     /// loss and must not be read as good news.
@@ -420,14 +420,14 @@ pub struct Feedback {
     /// Picture-loss requests. A decoder asking to be rescued is not a decoder
     /// with spare capacity.
     pub picture_loss: u32,
-    /// Retransmission requests. Not acted on — a NACK is loss that was
-    /// repaired, and the loss report already covers it — but worth seeing.
+    /// Retransmission requests. Not acted on, a NACK is loss that was
+    /// repaired, and the loss report already covers it, but worth seeing.
     pub nacks: u32,
     /// What actually went out over the interval, in bits per second.
     ///
     /// The measured rate, not the target: a still picture uses a fraction of
     /// its budget, and every judgement about the path has to be made against
-    /// the traffic that tested it. Zero when nothing was sent — paused, or
+    /// the traffic that tested it. Zero when nothing was sent, paused, or
     /// between sources.
     pub sent_bitrate: u32,
 }
@@ -444,7 +444,7 @@ pub struct Controller {
     bitrate: u32,
     /// Position on `FPS_LADDER`, not a frame rate. Holding the index means a
     /// `max_fps` that is not itself a rung caps what is reported without
-    /// freezing the ladder — which is what matching on the value would do,
+    /// freezing the ladder, which is what matching on the value would do,
     /// since no rung would ever equal the current frame rate again.
     rung: usize,
     max_fps: u32,
@@ -453,7 +453,7 @@ pub struct Controller {
     /// it ages. What the target is allowed to be built on.
     proven: u32,
     /// The previous receiver estimate, because the direction it moved is what
-    /// carries the meaning — see `update`.
+    /// carries the meaning, see `update`.
     last_estimate: Option<u32>,
 }
 
@@ -499,7 +499,7 @@ impl Controller {
         // rest of the time it simply creeps along above whatever it is being
         // sent, from a smoothed average. So an estimate that happens to sit
         // below the last second's output is the ordinary consequence of the
-        // encoder producing a busy second — braking on that is a false alarm,
+        // encoder producing a busy second, braking on that is a false alarm,
         // and a costly one: measured on a loopback connection with no possible
         // congestion, it clawed the rate back down every time the picture got
         // interesting.
@@ -507,7 +507,7 @@ impl Controller {
         // And a falling estimate is not enough on its own either, because it
         // falls just as readily when the *sending* rate falls. Switching to a
         // still window did exactly that, and drove the same session to the
-        // floor — which is what `pushing` is there to prevent.
+        // floor, which is what `pushing` is there to prevent.
         //
         // Skipped entirely when nothing was sent: an estimate of a stream that
         // was not flowing describes nothing.
@@ -556,8 +556,8 @@ impl Controller {
         }
 
         // Climbing needs fresh evidence, not merely a good history. A link
-        // that has gone quiet — no reports, no estimates, nothing coming back
-        // at all — is precisely where sending more is most likely to be the
+        // that has gone quiet, no reports, no estimates, nothing coming back
+        // at all, is precisely where sending more is most likely to be the
         // wrong move, and a run of calm seconds before it must not authorise
         // that.
         if calm && self.calm >= CALM_BEFORE_RAMP {
@@ -586,7 +586,7 @@ impl Controller {
     }
 }
 
-/// Scales without clamping to the stream's bitrate limits — for figures that
+/// Scales without clamping to the stream's bitrate limits, for figures that
 /// are evidence rather than targets.
 fn scale_raw(value: u32, factor: f64) -> u32 {
     (value as f64 * factor).round() as u32
@@ -621,7 +621,7 @@ fn next_rung(at: usize, bitrate: u32) -> usize {
     at
 }
 
-/// Reads the ladder the way the tests talk about it — in frame rates.
+/// Reads the ladder the way the tests talk about it, in frame rates.
 #[cfg(test)]
 fn next_fps(current: u32, bitrate: u32) -> u32 {
     let at = FPS_LADDER
@@ -670,7 +670,7 @@ impl Quality {
 mod tests {
     use super::*;
 
-    /// A clean second in which the encoder used its whole budget — what a busy
+    /// A clean second in which the encoder used its whole budget, what a busy
     /// source on a healthy link looks like.
     fn calm_at(sending: u32) -> Feedback {
         Feedback { loss: Some(0.0), sent_bitrate: sending, ..Default::default() }
@@ -708,7 +708,7 @@ mod tests {
     #[test]
     fn a_frame_rate_cap_off_the_ladder_still_lets_it_move() {
         // 45 is not a rung. Reporting min(rung, cap) must not stop the ladder
-        // from stepping down when the bitrate collapses — which is what
+        // from stepping down when the bitrate collapses, which is what
         // matching rungs by frame-rate value would have done.
         let mut c = Controller::new(MAX_BITRATE, 45);
         assert_eq!(c.target().fps, 45);
@@ -723,7 +723,7 @@ mod tests {
     fn a_clean_path_climbs_but_not_immediately() {
         let mut c = Controller::new(START_BITRATE, 60);
 
-        // One calm second is not enough on its own — a burst of loss often has
+        // One calm second is not enough on its own, a burst of loss often has
         // a quiet report in the middle of it.
         assert_eq!(c.update(&calm_at(START_BITRATE)).bitrate, START_BITRATE);
         assert!(
@@ -744,7 +744,7 @@ mod tests {
         assert!(c.update(&losing(0.4, MAX_BITRATE)).bitrate < MAX_BITRATE);
 
         // Four seconds of heavy loss must have taken the rate down by more
-        // than half — this is the way out of the failure, and it has to be
+        // than half, this is the way out of the failure, and it has to be
         // quicker than the failure itself.
         for _ in 0..3 {
             let sending = c.target().bitrate;
@@ -813,7 +813,7 @@ mod tests {
         let mut c = Controller::new(6_000_000, 60);
 
         // One figure on its own carries no direction, and direction is the
-        // whole of its meaning — nothing happens on the strength of it.
+        // whole of its meaning, nothing happens on the strength of it.
         assert_eq!(c.update(&estimating(6_000_000, 6_000_000)).bitrate, 6_000_000);
 
         // Now it falls. The receiver has seen its queue building and said what
@@ -851,7 +851,7 @@ mod tests {
         // The second false alarm, and the one that swapping sources produces
         // every time: a receiver's estimate follows the traffic, so switching
         // to a still window makes it fall exactly as it would under
-        // congestion. Measured — it took a real session to the floor and left
+        // congestion. Measured, it took a real session to the floor and left
         // it there.
         let mut c = Controller::new(START_BITRATE, 60);
         c.update(&estimating(2_000_000, 2_400_000));
@@ -872,7 +872,7 @@ mod tests {
         // The trap this guards, and the reason the comparison is not against
         // the target: a still picture uses a fraction of its budget, so an
         // estimate that tracks the picture reads far below the target and
-        // brakes — every second, for as long as the picture stays still, until
+        // brakes, every second, for as long as the picture stays still, until
         // the stream sits at the floor and cannot get back up even once there
         // is something to show. Measured on a real session before this.
         let mut c = Controller::new(6_000_000, 60);
@@ -920,7 +920,7 @@ mod tests {
     #[test]
     fn a_cheap_source_never_drags_the_rate_below_the_opening_one() {
         // The cap has a floor of the opening rate, so the worst a still window
-        // can do is put the stream back where a fresh session would start —
+        // can do is put the stream back where a fresh session would start,
         // never below it.
         let mut c = Controller::new(MAX_BITRATE, 60);
         for _ in 0..60 {
@@ -998,7 +998,7 @@ mod tests {
 
     #[test]
     fn frame_rate_steps_down_and_back_up_with_hysteresis() {
-        // Down at 3.5 Mbit/s, but not back up until 5 — a target sitting
+        // Down at 3.5 Mbit/s, but not back up until 5, a target sitting
         // between the two must not flip every second.
         assert_eq!(next_fps(60, 4_000_000), 60);
         assert_eq!(next_fps(60, 3_000_000), 30);

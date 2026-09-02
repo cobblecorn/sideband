@@ -1,6 +1,6 @@
 #![allow(dead_code)] // the send loop that drives this arrives with stage 6
 
-//! Stage 5 — WebRTC transport.
+//! Stage 5, WebRTC transport.
 //!
 //! We feed *already encoded* H.264 and Opus into the tracks, so none of the
 //! library's own encoders are involved. What we get in return is the part that
@@ -134,7 +134,7 @@ pub struct Session<P: PeerConnection> {
 /// STUN alone is enough for most home-to-home connections, but not all: when
 /// one side is behind carrier-grade NAT there is no hole to punch and the
 /// media has to be relayed. That is the classic "works at my house, fails at
-/// hers" failure, and it cannot be diagnosed after the fact — so TURN is
+/// hers" failure, and it cannot be diagnosed after the fact, so TURN is
 /// configured up front even though it will rarely be used.
 ///
 /// Blocking, because fetching Cloudflare credentials is an HTTP call. Call it
@@ -269,7 +269,7 @@ pub async fn connect(
     let video_ssrc = rand::random::<u32>();
     let audio_ssrc = rand::random::<u32>();
 
-    // The only place the viewer's RTCP is visible — see `bwe`. Without this
+    // The only place the viewer's RTCP is visible, see `bwe`. Without this
     // layer every connection looks perfect no matter what it is doing.
     let (watcher, feedback) = FeedbackWatcher::layer(video_ssrc);
     let registry = registry.with(watcher);
@@ -358,7 +358,7 @@ pub async fn connect(
 impl<P: PeerConnection> Session<P> {
 
     /// A complete offer with every ICE candidate already embedded. This is the
-    /// blob the pairing code maps to — see stage 6.
+    /// blob the pairing code maps to, see stage 6.
     pub async fn offer(&self) -> Result<String, String> {
         let offer = self
             .pc
@@ -417,7 +417,7 @@ impl<P: PeerConnection> Session<P> {
     }
 
     /// Everything the viewer has reported about the video stream since this
-    /// was last called. Reading clears it — see `bwe::ViewerFeedback`.
+    /// was last called. Reading clears it, see `bwe::ViewerFeedback`.
     pub fn viewer_feedback(&self) -> Feedback {
         self.feedback.take()
     }
@@ -476,7 +476,7 @@ impl<P: PeerConnection> Session<P> {
 }
 
 /// Microseconds from the media clock to ticks of an RTP clock. Wrapping is
-/// correct and expected — RTP timestamps are explicitly a 32-bit value that
+/// correct and expected, RTP timestamps are explicitly a 32-bit value that
 /// rolls over, and receivers handle the wrap.
 fn rtp_ticks(timestamp_us: u64, clock_hz: u64) -> u32 {
     ((timestamp_us.wrapping_mul(clock_hz)) / 1_000_000) as u32
@@ -525,7 +525,7 @@ mod tests {
     #[test]
     fn keyframe_requests_collapse() {
         // Several PLIs arriving between frames should cost one IDR, not one
-        // per request — a burst of them is exactly what packet loss produces.
+        // per request, a burst of them is exactly what packet loss produces.
         let s = KeyframeSignal::default();
         s.request();
         s.request();

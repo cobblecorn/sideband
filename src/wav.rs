@@ -39,7 +39,7 @@ impl WavWriter {
     }
 
     /// Writes `count` zero bytes. Used to fill the gaps where the target
-    /// process produced no audio at all — see the note in loopback.rs.
+    /// process produced no audio at all, see the note in loopback.rs.
     pub fn write_silence(&mut self, count: usize) -> std::io::Result<()> {
         const CHUNK: [u8; 4096] = [0u8; 4096];
         let mut left = count;

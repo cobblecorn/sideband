@@ -16,18 +16,18 @@
 ---
 
 You pick a window. They open a link and click Watch. They hear that window and
-nothing else — not your other tabs, not your voice chat, not your notifications.
+nothing else, not your other tabs, not your voice chat, not your notifications.
 
 Link-based browser screen sharing already exists, and so does proper per-process
 capture. What doesn't exist is both at once. Tools that share to a browser capture
-through `getDisplayMedia`, which can give a tab's audio or the whole system's —
-never one process's. Tools that capture properly need an install and an account
+through `getDisplayMedia`, which can give a tab's audio or the whole system's,
+but never one process's. Tools that capture properly need an install and an account
 on the viewing end. Sideband sits in both columns.
 
 ## Requirements
 
-- Windows 10 version 2004 or newer — the process-loopback audio API arrived there
-- An NVIDIA GPU — encoding is NVENC
+- Windows 10 version 2004 or newer, which is where the process-loopback audio API arrived
+- An NVIDIA GPU, because the encoding is NVENC
 - The viewer needs a browser. That's all.
 
 ## Install
@@ -39,7 +39,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 
 That copies the executable to `%LOCALAPPDATA%\Programs\Sideband` and makes a Start
 menu and desktop shortcut. It has to be copied somewhere rather than run from
-`target/release`, because that is a build directory — `cargo clean` empties it, and
+`target/release`, because that is a build directory. `cargo clean` empties it, and
 anything pinned to the taskbar breaks when it does.
 
 Run the script again after a rebuild to update the installed copy, or with
@@ -59,19 +59,19 @@ sideband share  [pid] [relay] pair by code through a relay
 sideband stream [pid] [port]  serve the viewer page yourself
 ```
 
-**On a LAN or a tailnet you need no relay at all** — `sideband stream` serves its
+**On a LAN or a tailnet you need no relay at all.** `sideband stream` serves its
 own viewer page and nothing external is involved.
 
-**Switching applications** — pick a different one at any point and the stream
+**Switching applications** - pick a different one at any point and the stream
 follows it, picture and audio both. Nothing is torn down: same connection, same
 code, same viewer, who simply starts seeing something else. In a terminal, press
 Enter for the list and type a number.
 
-**Microphone** — off by default. **Ctrl+Alt+M** toggles it globally, so it works
+**Microphone** - off by default. **Ctrl+Alt+M** toggles it globally, so it works
 without leaving the game. A mic that is on and reading 0% is muted or on the wrong
 device.
 
-**Quality** — there is no quality setting, because the right one is a property of
+**Quality** - there is no quality setting, because the right one is a property of
 the viewer's connection and neither of you knows it. A session opens at 2.5 Mbit/s
 and 30 fps, low enough for almost any home link to carry from the first frame, and
 climbs to 1080p60 at 10 Mbit/s over the next ten to twenty seconds if the viewer
@@ -126,7 +126,7 @@ npx wrangler dev --port 8787
 ### Point Sideband at it
 
 Paste the URL into the relay box in the window. It is remembered, so this is
-something you do once rather than once a session — it lives in
+something you do once rather than once a session. It lives in
 `%APPDATA%\Sideband\settings`, a plain text file you can open, edit or delete.
 
 For the command line, either pass it explicitly or set it in the environment:
@@ -147,7 +147,7 @@ than a box that never remembered anything.
 | Durable Object writes | a handful | generous | not the limit |
 
 The only line worth watching is TURN relay bandwidth, which applies when hole
-punching fails — usually carrier-grade NAT. That is a separate Cloudflare Realtime
+punching fails, which usually means carrier-grade NAT. That is a separate Cloudflare Realtime
 product with its own 1,000 GB/month allowance, and at roughly 4.5 GB/hour it covers
 about 220 hours of relayed streaming in the worst case where every session relays.
 Most home-to-home connections go direct and use none of it.
@@ -195,7 +195,7 @@ signalling server, and it is exactly what running your own answers.
 | Source | `EnumWindows`, one entry per process, swappable mid-stream |
 | Video | Windows.Graphics.Capture → D3D11 texture, follows window resizes |
 | Audio | WASAPI process loopback, scoped to the target's process tree |
-| Encode | NVENC, fed the texture directly — no CPU readback, no colour conversion |
+| Encode | NVENC, fed the texture directly with no CPU readback or colour conversion |
 | Transport | WebRTC, pre-encoded H.264 + Opus |
 | Rate control | The viewer's REMB and receiver reports, read off the RTCP stream |
 | Pairing | Non-trickle SDP through a Worker, or served locally |
@@ -204,7 +204,7 @@ Three invariants worth knowing before changing anything:
 
 **Silence and stillness are not "no data".** Process loopback delivers no packets
 while an app is quiet, and window capture delivers no frames while a window is still.
-Both are filled against a wall clock — synthesised silence and repeated frames —
+Both are filled against a wall clock with synthesised silence and repeated frames,
 because an encoder fed irregularly produces a stream whose tracks drift apart within
 a minute.
 
@@ -215,7 +215,7 @@ network hop.
 
 **`get_stats` cannot see incoming RTCP.** `rtc` 0.20.4 defines
 `process_read_rtcp_for_stats` and never calls it, and the innermost interceptor in
-the chain drops RTCP rather than forwarding it — so the library reports zero loss,
+the chain drops RTCP rather than forwarding it, so the library reports zero loss,
 zero NACKs and zero picture-loss requests however badly a connection is doing. Rate
 control therefore reads the packets itself, from inside the interceptor chain. Do not
 "simplify" it back onto `get_stats`: it will compile, run, and quietly believe every
@@ -224,7 +224,7 @@ connection is perfect.
 ## The mark
 
 A sideband is the band of frequencies beside a carrier wave, and single-sideband
-radio transmits one of them and suppresses the rest — a narrow, point-to-point
+radio transmits one of them and suppresses the rest. It is a narrow, point-to-point
 signal with everything else left out. That is what this does with a desktop, so that
 is what the icon draws: a tall carrier, two bands falling away to the right, and the
 pair on the left faded almost to nothing.
@@ -258,10 +258,10 @@ cargo test
 - **TURN has never fired.** Every connection so far has gone direct. The fallback is
   configured but unexercised, so carrier-grade NAT is still an open question.
 - **No periodic keyframes.** Forcing an IDR mid-stream against `rtc-rtp` 0.20.4
-  breaks decoding outright — measured. Loss recovery relies on NACK retransmission
-  instead.
+  breaks decoding outright. That is measured, not assumed. Loss recovery relies on
+  NACK retransmission instead.
 - **One viewer per session.** A dropped connection ends the session and says so. A
-  source window closing does not — pick another application and the stream carries
+  source window closing does not - pick another application and the stream carries
   on.
 - **Resolution never changes**, only bitrate and frame rate. A new resolution needs a
   new SPS, and this stream deliberately sends parameter sets exactly once.

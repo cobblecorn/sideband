@@ -1,7 +1,7 @@
 // Sideband signalling relay.
 //
 // This Worker never sees a video frame. Its entire job is to hold two blobs of
-// text — an SDP offer and an SDP answer — long enough for two machines that
+// text, an SDP offer and an SDP answer, long enough for two machines that
 // cannot reach each other to swap them, after which the peers talk directly
 // and this is out of the picture.
 //
@@ -19,7 +19,7 @@
 //     worthless to anyone who later learns it.
 //
 //   * Only the host can read the answer. An answer contains the viewer's ICE
-//     candidates, which include their public IP — leaving that world-readable
+//     candidates, which include their public IP, leaving that world-readable
 //     hands anyone who guesses a code the viewer's address, which they never
 //     agreed to.
 //
@@ -42,7 +42,7 @@
 /// is dead before it is useful.
 const TTL_MS = 5 * 60 * 1000;
 
-/// Excludes O/0/I/1/L — the characters people mishear and mistype. 31^6 is
+/// Excludes O/0/I/1/L, the characters people mishear and mistype. 31^6 is
 /// about 8.9e8, which is only meaningful alongside the rate limits below.
 const ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 const CODE_LENGTH = 6;
@@ -382,7 +382,7 @@ function page(prefill) {
   #panel { text-align:center; }
   h1 { font-size:15px; font-weight:600; letter-spacing:.14em; text-transform:uppercase;
     color:#f0a93b; margin:0 0 6px; }
-  /* Geometry from src/mark.rs — the window icon and the executable's own
+  /* Geometry from src/mark.rs, the window icon and the executable's own
      icon are rasterised from the same numbers. */
   .mark { width:38px; height:38px; display:block; margin:0 auto 10px; }
   p { color:#98a4b1; margin:0 0 18px; }
@@ -526,7 +526,7 @@ async function attempt(code, onStatus) {
 }
 
 // One retry only, and only for failures that happen after the code was
-// accepted — a claimed or expired code will not become valid by asking again.
+// accepted, a claimed or expired code will not become valid by asking again.
 async function connectWithRetry(code, onStatus, onFailure) {
   for (let tryNo = 1; tryNo <= 2; tryNo++) {
     try {
@@ -535,7 +535,7 @@ async function connectWithRetry(code, onStatus, onFailure) {
       if (window.pc) { try { window.pc.close(); } catch (_) {} }
       const fatal = /already been used|already watching|expired|Too many/.test(e.message);
       if (fatal || tryNo === 2) throw e;
-      onStatus('That did not take — trying once more…');
+      onStatus('That did not take - trying once more…');
       await new Promise((r) => setTimeout(r, 1500));
     }
   }

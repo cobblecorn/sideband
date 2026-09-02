@@ -4,7 +4,7 @@
 //! than pixels you can hand to a renderer. Getting RGBA out of one means
 //! asking GDI for the colour bits, and then undoing two things it does that
 //! are wrong for our purposes: it hands back BGRA, and for icons that predate
-//! 32-bit colour the alpha channel is all zeroes — which would draw a
+//! 32-bit colour the alpha channel is all zeroes, which would draw a
 //! perfectly transparent icon if taken at face value.
 
 use std::collections::HashMap;
@@ -28,7 +28,7 @@ pub struct Icon {
 /// Icons keyed by executable path.
 ///
 /// Shell lookups touch the disk, so a list that redraws sixty times a second
-/// must not repeat them. Failures are cached as `None` too — a path that has
+/// must not repeat them. Failures are cached as `None` too, a path that has
 /// no icon will not grow one, and retrying it every frame is the same cost as
 /// succeeding.
 #[derive(Default)]
@@ -151,7 +151,7 @@ unsafe fn colour_bits(bitmap: windows::Win32::Graphics::Gdi::HBITMAP) -> Option<
         }
 
         // GDI gives BGRA. Older icons also come back with alpha zeroed, which
-        // would render as nothing at all — if no pixel claims to be visible,
+        // would render as nothing at all, if no pixel claims to be visible,
         // treat the icon as fully opaque rather than invisible.
         let opaque = buffer.chunks_exact(4).all(|p| p[3] == 0);
         for px in buffer.chunks_exact_mut(4) {

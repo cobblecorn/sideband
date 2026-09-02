@@ -1,4 +1,4 @@
-//! Stage 1 — enumerate candidate capture sources.
+//! Stage 1, enumerate candidate capture sources.
 //!
 //! Video capture will want the HWND; audio capture wants the PID. We collect
 //! both, then collapse to one row per process: a game typically owns several
@@ -56,7 +56,7 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let title = String::from_utf16_lossy(&buf[..n as usize]);
 
         // The desktop and taskbar are visible, titled and enumerable, but
-        // Windows.Graphics.Capture produces no frames for them — offering one
+        // Windows.Graphics.Capture produces no frames for them, offering one
         // gives a stream that connects and then shows nothing at all.
         if is_shell_window(hwnd) {
             return TRUE;

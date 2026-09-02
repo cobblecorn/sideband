@@ -3,7 +3,7 @@
 //! Deliberately a plain text file rather than the registry or a serialised
 //! blob: it lives somewhere a person can open, it can be read at a glance,
 //! and a corrupt or hand-edited one degrades to defaults rather than to a
-//! parse error. Nothing here is important enough to be worth failing over —
+//! parse error. Nothing here is important enough to be worth failing over,
 //! every path returns a default rather than an error, because a relay URL
 //! that could not be read back is an inconvenience, not a fault.
 
@@ -21,7 +21,7 @@ impl Settings {
     /// nothing at all.
     ///
     /// The remembered value wins over `SIDEBAND_RELAY`, because it is what the
-    /// person most recently typed into the box — a field that quietly ignores
+    /// person most recently typed into the box, a field that quietly ignores
     /// what you put in it is worse than one that never remembered anything.
     /// The variable still seeds a machine that has never been told a relay.
     pub fn load() -> Self {
@@ -78,7 +78,7 @@ fn path() -> Option<PathBuf> {
 }
 
 /// `key = value` a line at a time. Blank lines and `#` comments are skipped,
-/// and so is anything that does not look like a setting — a file someone has
+/// and so is anything that does not look like a setting, a file someone has
 /// typed into by hand should lose the line they got wrong, not the rest.
 fn parse(text: &str) -> Vec<(String, String)> {
     text.lines()
@@ -101,7 +101,7 @@ mod tests {
 
     #[test]
     fn an_empty_relay_round_trips_as_empty() {
-        // Clearing the box is a choice — serve locally — and has to survive a
+        // Clearing the box is a choice, serve locally, and has to survive a
         // restart just as a URL does.
         let written = Settings::default().serialise();
         assert_eq!(parse(&written), vec![("relay".into(), String::new())]);
@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn saving_makes_the_directory_it_needs_and_reads_back() {
         // The write path itself, including the profile directory not existing
-        // yet — which is every first run.
+        // yet, which is every first run.
         let dir = std::env::temp_dir().join(format!("sideband-{}-settings", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let file = dir.join("Sideband").join("settings");

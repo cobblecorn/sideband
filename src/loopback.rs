@@ -1,4 +1,4 @@
-//! Stage 3 — capture audio from one process tree and nothing else.
+//! Stage 3, capture audio from one process tree and nothing else.
 //!
 //! This is the whole premise of the project. `ActivateAudioInterfaceAsync`
 //! against the process-loopback virtual device gives us a normal `IAudioClient`
@@ -11,7 +11,7 @@
 //!     format you want and the audio engine converts into it.
 //!   * When the target process is silent it delivers *no packets at all*,
 //!     rather than buffers of zeros. Anything downstream that assumes a
-//!     continuous stream — an encoder, a muxer, a WebRTC track — will drift
+//!     continuous stream, an encoder, a muxer, a WebRTC track, will drift
 //!     against the video within about a minute. The fix is to notice the gap
 //!     against a wall clock and synthesise the missing silence, which is what
 //!     `Capture::pump` does below.
@@ -106,12 +106,12 @@ impl Capture {
 
             // The activation params travel as a VT_BLOB PROPVARIANT. There is
             // no safe constructor for that variant, so it is assembled from
-            // the crate's own structs — the field offsets are then not our
+            // the crate's own structs, the field offsets are then not our
             // assumption to get wrong.
             //
             // The outer ManuallyDrop is load-bearing. `windows` implements
             // Drop for PROPVARIANT as a call to PropVariantClear, which would
-            // try to free pBlobData — a pointer to `params`, which lives on
+            // try to free pBlobData, a pointer to `params`, which lives on
             // our stack. Letting this value drop corrupts the heap and takes
             // the process down a moment after activation succeeds.
             let activation = ManuallyDrop::new(PROPVARIANT {
@@ -218,8 +218,8 @@ impl Capture {
                     let _ = w.write_silence(missing as usize * BLOCK_ALIGN);
                 }
 
-                // The synthesised silence goes to the encoder too — that is
-                // the entire point of generating it — and the mic is mixed
+                // The synthesised silence goes to the encoder too, that is
+                // the entire point of generating it, and the mic is mixed
                 // into it, because a silent game with the mic live is exactly
                 // when the viewer most needs to hear you.
                 let quiet_samples = missing as usize * CHANNELS as usize;
@@ -320,7 +320,7 @@ pub fn record_to_wav(
         let mut cap = Capture::open(pid).map_err(|e| {
             format!(
                 "could not open process loopback for pid {pid}: {e}\n  \
-                 (if this is 0x80070005 the target is likely elevated — \
+                 (if this is 0x80070005 the target is likely elevated - \
                  run this from an admin shell too)"
             )
         })?;
@@ -328,7 +328,7 @@ pub fn record_to_wav(
         let mut wav = WavWriter::create(path, SAMPLE_RATE, CHANNELS, BITS)
             .map_err(|e| format!("could not create {}: {e}", path.display()))?;
 
-        // 128 kbit/s stereo — plenty for game audio, and small next to video.
+        // 128 kbit/s stereo, plenty for game audio, and small next to video.
         let mut opus = OpusStream::new(128_000)?;
 
         while !stop.load(Ordering::Relaxed) {
@@ -370,7 +370,7 @@ const REOPEN_AFTER: std::time::Duration = std::time::Duration::from_millis(400);
 /// at all.
 ///
 /// The Opus timeline advances by however many samples it is fed, so a gap left
-/// unfilled is one the audio never makes up — it would sit permanently that far
+/// unfilled is one the audio never makes up, it would sit permanently that far
 /// behind the video for the rest of the session. Switching applications takes
 /// long enough for that to matter.
 fn silence_for(elapsed: std::time::Duration, mic: Option<&Mic>) -> Vec<i16> {

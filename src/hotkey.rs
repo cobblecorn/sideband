@@ -22,7 +22,7 @@ pub const DESCRIPTION: &str = "Ctrl+Alt+M";
 
 /// Spawns a thread that flips `flag` whenever the hotkey is pressed, calling
 /// `on_toggle` with the new state. Returns false if the combination could not
-/// be registered — usually because something else already owns it.
+/// be registered, usually because something else already owns it.
 pub fn spawn_toggle<F>(flag: Arc<AtomicBool>, on_toggle: F) -> bool
 where
     F: Fn(bool) + Send + 'static,

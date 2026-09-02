@@ -4,7 +4,7 @@ compatibility_date = "2026-08-01"
 
 # State lives in Durable Objects rather than KV.
 #
-# Claiming a session is a read-then-write — check whether anyone has answered,
+# Claiming a session is a read-then-write, check whether anyone has answered,
 # then record that they have. KV cannot do that atomically, so two viewers
 # racing would both see "unclaimed" and the second would overwrite the first.
 # That is not a theoretical race: it is exactly how someone holding a leaked

@@ -1,7 +1,7 @@
 //! Shared state between the streaming threads and whatever is showing it.
 //!
 //! The capture, encode and send paths do not know whether a window or a
-//! terminal is watching — they push facts in here and something else decides
+//! terminal is watching, they push facts in here and something else decides
 //! how to draw them. That is what lets the same engine back both the GUI and
 //! the command line without either one owning the other.
 
@@ -31,7 +31,7 @@ const NOTICE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(6);
 
 pub struct Session {
     phase: Mutex<Phase>,
-    source: Mutex<String>,
+    source: Mutex<(String, String)>,
     resolution: Mutex<String>,
 
     /// The process the stream should be showing right now.
@@ -43,7 +43,7 @@ pub struct Session {
     selected: AtomicU32,
 
     /// Something worth telling the person at the keyboard, and when it was
-    /// said. Short-lived by design — a switch that could not be made needs an
+    /// said. Short-lived by design, a switch that could not be made needs an
     /// explanation at the moment it fails, not a permanent banner.
     notice: Mutex<Option<(String, Instant)>>,
 
@@ -81,7 +81,7 @@ impl Default for Session {
     fn default() -> Self {
         Self {
             phase: Mutex::new(Phase::Idle),
-            source: Mutex::new(String::new()),
+            source: Mutex::new((String::new(), String::new())),
             resolution: Mutex::new(String::new()),
             selected: AtomicU32::new(0),
             notice: Mutex::new(None),
@@ -119,17 +119,19 @@ impl Session {
         self.set_phase(Phase::Failed(why.into()));
     }
 
-    pub fn source(&self) -> String {
+    /// The application being shared, as its executable and its window title.
+    ///
+    /// Kept as two strings rather than one joined one. Window titles routinely
+    /// contain the separator any joined form would need to be split on again
+    /// ("Meme Harvester - Google Chrome"), so joining them means choosing a
+    /// character that titles never use, and then hoping.
+    pub fn source(&self) -> (String, String) {
         self.source.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
     pub fn set_source(&self, exe: &str, title: &str) {
         if let Ok(mut v) = self.source.lock() {
-            *v = if title.is_empty() {
-                exe.to_owned()
-            } else {
-                format!("{exe} — {title}")
-            };
+            *v = (exe.to_owned(), title.to_owned());
         }
     }
 
@@ -241,7 +243,7 @@ impl Session {
         self.mic_on.store(on, Ordering::Relaxed);
     }
 
-    /// Peak level 0.0–1.0. Reading does not clear it; the capture side owns
+    /// Peak level 0.0-1.0. Reading does not clear it; the capture side owns
     /// the reset so the display can be redrawn as often as it likes without
     /// stealing readings from itself.
     pub fn mic_peak(&self) -> f32 {
@@ -372,6 +374,27 @@ mod tests {
     }
 
     #[test]
+    fn a_window_title_containing_a_dash_survives_intact() {
+        // The reason the two halves are stored separately. Almost every
+        // browser and editor window is titled "document - application", so any
+        // single string that had to be split apart again would lose half the
+        // title to the first separator it found.
+        let s = Session::default();
+        s.set_source("chrome.exe", "Meme Harvester - Google Chrome");
+        assert_eq!(
+            s.source(),
+            ("chrome.exe".to_owned(), "Meme Harvester - Google Chrome".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_source_with_no_title_reports_an_empty_one() {
+        let s = Session::default();
+        s.set_source("solo.exe", "");
+        assert_eq!(s.source(), ("solo.exe".to_owned(), String::new()));
+    }
+
+    #[test]
     fn quality_is_absent_until_a_stream_is_running() {
         let s = Session::default();
         assert_eq!(s.quality(), None, "nothing to report before anything is encoded");
@@ -404,7 +427,7 @@ mod tests {
 
         s.note("could not capture that window");
         assert_eq!(s.notice().as_deref(), Some("could not capture that window"));
-        // Reading does not consume it — the window redraws many times a second
+        // Reading does not consume it, the window redraws many times a second
         // and a notice that vanished on first paint would never be seen.
         assert!(s.notice().is_some());
     }

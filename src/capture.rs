@@ -1,8 +1,8 @@
-//! Stage 2 — capture a single window's pixels via Windows.Graphics.Capture.
+//! Stage 2, capture a single window's pixels via Windows.Graphics.Capture.
 //!
 //! WGC hands back GPU textures, which is the whole point: in the real pipeline
 //! the texture goes straight into NVENC and never touches the CPU. This module
-//! deliberately breaks that rule at the very end — it copies one frame down to
+//! deliberately breaks that rule at the very end, it copies one frame down to
 //! a staging texture so it can be written to disk as proof the capture works.
 //! Nothing downstream of stage 4 should ever do that.
 
@@ -118,7 +118,7 @@ impl WindowCapture {
     }
 
     /// Pulls whatever frame is ready, if any. Returns its dimensions.
-    /// `save_to` writes that frame out as a BMP — for the test only.
+    /// `save_to` writes that frame out as a BMP, for the test only.
     pub fn try_frame(&self, save_to: Option<&Path>) -> Result<Option<(u32, u32)>> {
         let Ok(frame) = self.pool.TryGetNextFrame() else {
             return Ok(None);
@@ -147,7 +147,7 @@ impl WindowCapture {
     }
 
     /// The next frame as a raw GPU texture plus its dimensions. This is the
-    /// path the real pipeline uses — nothing is copied to the CPU.
+    /// path the real pipeline uses, nothing is copied to the CPU.
     pub fn next_texture(&self) -> Result<Option<(ID3D11Texture2D, u32, u32)>> {
         let Ok(frame) = self.pool.TryGetNextFrame() else {
             return Ok(None);
@@ -209,7 +209,7 @@ impl WindowCapture {
             let mut pixels = vec![0u8; w * h * 4];
 
             // BMP rows run bottom-up; WGC gives us top-down. Flip while
-            // copying, and honour RowPitch — it is usually wider than w*4.
+            // copying, and honour RowPitch, it is usually wider than w*4.
             for y in 0..h {
                 let src = (mapped.pData as *const u8).add(y * mapped.RowPitch as usize);
                 let dst_row = h - 1 - y;

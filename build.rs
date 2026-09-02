@@ -1,7 +1,7 @@
 //! Puts the mark on the executable.
 //!
 //! The icon is rasterised here from `src/mark.rs` rather than kept as a file
-//! next to it — the same geometry the window icon uses at runtime, so the two
+//! next to it, the same geometry the window icon uses at runtime, so the two
 //! cannot drift. That is also why `mark.rs` depends on nothing: this build
 //! script includes its source directly, outside the crate it normally belongs
 //! to.
@@ -21,7 +21,7 @@ fn main() {
 /// Every size Windows will ask for: the tray and the title bar at the bottom,
 /// the extra-large view in Explorer at the top. Anything missing is scaled
 /// from a neighbour by the shell, which is exactly the mush the compact cut
-/// exists to avoid — so each one is drawn rather than left to be derived.
+/// exists to avoid, so each one is drawn rather than left to be derived.
 #[cfg(windows)]
 const SIZES: &[u32] = &[16, 20, 24, 32, 40, 48, 64, 128, 256];
 
