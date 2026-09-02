@@ -1,0 +1,158 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Sideband</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='114' fill='%2314181d'/%3E%3Cg fill='%23f0a93b'%3E%3Crect x='214' y='86' width='84' height='340' rx='42'/%3E%3Crect x='332' y='146' width='84' height='220' rx='42'/%3E%3Crect x='96' y='146' width='84' height='220' rx='42' opacity='.3'/%3E%3C/g%3E%3C/svg%3E">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; height:100vh; background:#14181d; color:#e4e9ee;
+    font:15px/1.5 ui-sans-serif,system-ui,"Segoe UI",sans-serif; display:grid; place-items:center; }
+  #stage { width:100%; height:100%; display:grid; place-items:center; }
+  video { max-width:100%; max-height:100vh; display:none; background:#000; }
+  #panel { text-align:center; }
+  h1 { font-size:15px; font-weight:600; letter-spacing:.14em; text-transform:uppercase;
+    color:#f0a93b; margin:0 0 6px; }
+  /* Geometry from src/mark.rs — the window icon and the executable's own
+     icon are rasterised from the same numbers. */
+  .mark { width:38px; height:38px; display:block; margin:0 auto 10px; }
+  p { color:#98a4b1; margin:0 0 22px; }
+  button { display:block; margin:0 auto; font:inherit; font-weight:600; color:#14181d;
+    background:#f0a93b; border:0; border-radius:4px; padding:11px 26px; cursor:pointer; }
+  button:disabled { background:#3d4652; color:#98a4b1; cursor:default; }
+  button:focus-visible { outline:2px solid #f0a93b; outline-offset:3px; }
+</style>
+
+<div id="stage">
+  <div id="panel">
+    <svg class="mark" viewBox="0 0 512 512" aria-hidden="true">
+      <g fill="#f0a93b">
+        <rect x="226" y="96" width="60" height="320" rx="30"/>
+        <rect x="314" y="156" width="60" height="200" rx="30"/>
+        <rect x="402" y="198" width="60" height="116" rx="30"/>
+        <rect x="138" y="156" width="60" height="200" rx="30" opacity=".28"/>
+        <rect x="50" y="198" width="60" height="116" rx="30" opacity=".28"/>
+      </g>
+    </svg>
+    <h1>Sideband</h1>
+    <p id="status">Ready.</p>
+    <button id="go">Watch</button>
+  </div>
+  <video id="v" autoplay playsinline controls></video>
+</div>
+
+<script>
+const statusEl = document.getElementById('status');
+const button = document.getElementById('go');
+const video = document.getElementById('v');
+const panel = document.getElementById('panel');
+const say = (t) => { statusEl.textContent = t; };
+
+// The secret is the path this page was served from. It never goes in a query
+// string, because those end up in browser history and server logs.
+const SECRET = location.pathname.split('/').filter(Boolean)[1] || '';
+const base = '/v/' + SECRET;
+
+const reset = (msg) => {
+  say(msg);
+  panel.style.display = '';
+  video.style.display = 'none';
+  button.disabled = false;
+};
+
+button.onclick = async () => {
+  button.disabled = true;
+  try {
+    const pc = await connectWithRetry();
+    panel.style.display = 'none';
+    video.style.display = 'block';
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        reset('Disconnected.');
+      }
+    };
+  } catch (e) {
+    reset(e.message);
+  }
+};
+
+// Waits for ICE gathering on evidence rather than a fixed deadline: as soon as
+// a usable set of candidates exists we go, and we only give up early if the
+// browser produced nothing at all. A fixed timeout would post an answer with
+// too few candidates on a slower network, which fails to connect and looks
+// like "it needs a retry".
+async function gather(pc, { minCandidates = 2, settle = 700, hardCap = 12000 } = {}) {
+  if (pc.iceGatheringState === 'complete') return;
+
+  let count = 0;
+  let lastAt = 0;
+  const started = Date.now();
+  pc.addEventListener('icecandidate', (e) => {
+    if (e.candidate) { count++; lastAt = Date.now(); }
+  });
+
+  while (Date.now() - started < hardCap) {
+    if (pc.iceGatheringState === 'complete') return;
+    if (count >= minCandidates && lastAt && Date.now() - lastAt > settle) return;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  if (count === 0) throw new Error('No network route found. A firewall may be blocking it.');
+}
+
+async function attempt() {
+  say('Connecting…');
+  const res = await fetch(base + '/offer', { cache: 'no-store' });
+  if (res.status === 410) throw new Error('Someone is already watching this one.');
+  if (res.status === 404) throw new Error('That link is not valid any more.');
+  if (!res.ok) throw new Error('Could not reach the host.');
+  const offer = await res.text();
+
+  const pc = new RTCPeerConnection();
+  window.pc = pc;
+
+  // Attached before setRemoteDescription: a track can arrive the moment the
+  // description is applied, and a listener added afterwards would miss it.
+  pc.ontrack = (e) => {
+    if (video.srcObject !== e.streams[0]) video.srcObject = e.streams[0];
+  };
+
+  const connected = new Promise((resolve, reject) => {
+    pc.addEventListener('connectionstatechange', () => {
+      if (pc.connectionState === 'connected') resolve();
+      if (pc.connectionState === 'failed') reject(new Error('Connection failed.'));
+    });
+    setTimeout(() => reject(new Error('Timed out connecting.')), 25000);
+  });
+
+  await pc.setRemoteDescription({ type: 'offer', sdp: offer });
+  await pc.setLocalDescription(await pc.createAnswer());
+
+  say('Finding a route…');
+  await gather(pc);
+
+  const post = await fetch(base + '/answer', { method: 'POST', body: pc.localDescription.sdp });
+  if (post.status === 409) throw new Error('Someone is already watching this one.');
+  if (!post.ok) throw new Error('Could not reply to the host.');
+
+  await connected;
+  return pc;
+}
+
+// One retry, and only for failures that could plausibly succeed next time. A
+// claimed or invalid link will not become valid by asking again.
+async function connectWithRetry() {
+  for (let tryNo = 1; tryNo <= 2; tryNo++) {
+    try {
+      return await attempt();
+    } catch (e) {
+      if (window.pc) { try { window.pc.close(); } catch (_) {} }
+      const fatal = /already watching|not valid/.test(e.message);
+      if (fatal || tryNo === 2) throw e;
+      say('That did not take — trying once more…');
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+}
+</script>

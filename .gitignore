@@ -1,0 +1,7 @@
+target
+*.wav
+*.bmp
+*.h264
+Cargo.toml.bak
+worker/node_modules
+worker/.wrangler

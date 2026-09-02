@@ -1,0 +1,30 @@
+name = "sideband"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+# State lives in Durable Objects rather than KV.
+#
+# Claiming a session is a read-then-write — check whether anyone has answered,
+# then record that they have. KV cannot do that atomically, so two viewers
+# racing would both see "unclaimed" and the second would overwrite the first.
+# That is not a theoretical race: it is exactly how someone holding a leaked
+# code would steal a session out from under the person it was meant for.
+#
+# A Durable Object handles one request at a time, which makes "claimed exactly
+# once" a property of the system rather than a hope about timing.
+
+[[durable_objects.bindings]]
+name = "SESSIONS"
+class_name = "SignallingSession"
+
+[[durable_objects.bindings]]
+name = "LIMITS"
+class_name = "RateLimiter"
+
+# SQLite-backed classes are the ones available on the free plan.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SignallingSession", "RateLimiter"]
+
+[observability]
+enabled = true
