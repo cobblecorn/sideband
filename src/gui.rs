@@ -37,6 +37,13 @@ const FAINT: Color32 = Color32::from_rgb(0x6c, 0x78, 0x84);
 /// that is a second stale.
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
 
+/// How long closing the window waits for a live session to wind itself up.
+///
+/// Long enough for a peer connection to close and the threads to notice, short
+/// enough that nobody thinks the window has hung. Whatever has not finished by
+/// then is not going to be waited for, see the exit in `main`.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(1200);
+
 /// The strip's two heights. A dropdown has nowhere to go in a window this
 /// short, so choosing a source grows the window instead and it snaps back
 /// afterwards, the thin shape is the point, and it should only be given up
@@ -70,6 +77,11 @@ pub struct App {
     /// What is on disk, so the file is only rewritten when the box actually
     /// changes rather than on every frame it is looked at.
     saved_relay: String,
+    /// Let whoever has the code in without asking. Remembered between runs,
+    /// because someone who wants this wants it every time.
+    auto_approve: bool,
+    /// The saved counterpart, for the same reason as `saved_relay`.
+    saved_auto_approve: bool,
     session: Option<Arc<Session>>,
     rates: Rates,
     /// Whether the source list is expanded. Mirrored so the viewport is only
@@ -90,7 +102,8 @@ impl Default for App {
     fn default() -> Self {
         // Whatever relay was last used. Typing one in should be something you
         // do once, not once a session.
-        let remembered = Settings::load().relay;
+        let settings = Settings::load();
+        let remembered = settings.relay;
 
         Self {
             sources: Vec::new(),
@@ -99,6 +112,8 @@ impl Default for App {
             selected: None,
             relay: remembered.clone(),
             saved_relay: remembered,
+            auto_approve: settings.auto_approve,
+            saved_auto_approve: settings.auto_approve,
             session: None,
             rates: Rates::default(),
             picking: false,
@@ -196,20 +211,27 @@ impl App {
     }
 
     /// Writes the relay down, if it has moved since it was last written.
-    fn remember_relay(&mut self) {
-        let current = self.relay.trim().to_owned();
-        if current == self.saved_relay {
+    /// Writes the remembered settings, if any of them have actually changed.
+    ///
+    /// The guard is not an optimisation. This is reachable from the paint
+    /// loop, and a file rewritten every frame a window happens to be open is
+    /// a file that will eventually be caught half written.
+    fn remember(&mut self) {
+        let relay = self.relay.trim().to_owned();
+        if relay == self.saved_relay && self.auto_approve == self.saved_auto_approve {
             return;
         }
-        Settings { relay: current.clone() }.save();
-        self.saved_relay = current;
+        Settings { relay: relay.clone(), auto_approve: self.auto_approve }.save();
+        self.saved_relay = relay;
+        self.saved_auto_approve = self.auto_approve;
     }
 
     fn start(&mut self) {
         let Some(pid) = self.selected else { return };
-        self.remember_relay();
+        self.remember();
 
         let session = Arc::new(Session::default());
+        session.set_auto_approve(self.auto_approve);
         self.session = Some(Arc::clone(&session));
         self.rates = Rates::default();
 
@@ -238,7 +260,24 @@ impl eframe::App for App {
     /// relay pasted in and never used would be gone by the next launch, which
     /// is exactly the thing remembering it is meant to stop.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.remember_relay();
+        self.remember();
+
+        // Closing the window ends the session, and this waits for the end
+        // rather than only asking for it. Two reasons, and the second is the
+        // one that bites: the viewer is told the sharing finished instead of
+        // being left on a frozen last frame until their connection times out,
+        // and the capture, the encoder session and the audio client are handed
+        // back by code that owns them rather than by the process dying on top
+        // of them.
+        if let Some(s) = self.session.take() {
+            s.request_stop();
+            let deadline = Instant::now() + SHUTDOWN_GRACE;
+            while Instant::now() < deadline
+                && !matches!(s.phase(), Phase::Idle | Phase::Ended | Phase::Failed(_))
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -405,7 +444,7 @@ impl App {
                 // On leaving the field rather than on every keystroke, so a
                 // half-typed URL is never the one that gets remembered.
                 if field.lost_focus() {
-                    self.remember_relay();
+                    self.remember();
                 }
                 ui.label(RichText::new("relay").color(FAINT).size(10.0));
             });
@@ -667,6 +706,23 @@ impl App {
                     let now = !s.mic_on();
                     s.set_mic_on(now);
                 }
+            }
+
+            // Enabled whether or not a session is running: it is a decision
+            // about the next person to arrive, and the useful moment to make
+            // it is before sending the code, not while someone is waiting.
+            if pill(ui, "auto admit", self.auto_approve, true)
+                .on_hover_text(
+                    "let whoever has the code straight in, with no prompt here.\n\
+                     The code is then the only thing standing between them and your screen.",
+                )
+                .clicked()
+            {
+                self.auto_approve = !self.auto_approve;
+                if let Some(s) = &session {
+                    s.set_auto_approve(self.auto_approve);
+                }
+                self.remember();
             }
 
             let paused = session.as_ref().is_some_and(|s| s.paused());

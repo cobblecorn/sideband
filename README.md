@@ -67,6 +67,12 @@ follows it, picture and audio both. Nothing is torn down: same connection, same
 code, same viewer, who simply starts seeing something else. In a terminal, press
 Enter for the list and type a number.
 
+**Auto admit** - off by default. With it on, whoever opens the link is let
+straight in and nothing is asked on your end, which is what you want if you are
+not sitting at the keyboard when they arrive. It also makes the code the only
+thing between them and your screen, so it is a per-machine choice and it is
+remembered.
+
 **Microphone** - off by default. **Ctrl+Alt+M** toggles it globally, so it works
 without leaving the game. A mic that is on and reading 0% is muted or on the wrong
 device.
@@ -273,6 +279,10 @@ cargo test
 - **One viewer per session.** A dropped connection ends the session and says so. A
   source window closing does not - pick another application and the stream carries
   on.
+- **A viewer who freezes has to be sent a fresh link.** With no keyframe to
+  repair them with, a decoder broken by heavy loss stays broken, and the code
+  has already been spent. The rate control exists to keep that from happening
+  rather than to recover from it.
 - **Resolution never changes**, only bitrate and frame rate. A new resolution needs a
   new SPS, and this stream deliberately sends parameter sets exactly once.
 - **Packaged ("Store") applications may have no capturable audio.** Their window

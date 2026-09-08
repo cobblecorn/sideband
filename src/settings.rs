@@ -14,6 +14,13 @@ use std::path::{Path, PathBuf};
 pub struct Settings {
     /// The relay the window was last pointed at. Empty means serve locally.
     pub relay: String,
+    /// Let whoever holds the code straight in, with no prompt on this end.
+    ///
+    /// Off unless it has been turned on, and stays off if the file says
+    /// anything this cannot read as a clear yes. A setting that decides who
+    /// gets to see your screen is one where the safe reading of a typo is
+    /// "no".
+    pub auto_approve: bool,
 }
 
 impl Settings {
@@ -29,8 +36,10 @@ impl Settings {
 
         if let Some(text) = path().and_then(|p| std::fs::read_to_string(p).ok()) {
             for (key, value) in parse(&text) {
-                if key == "relay" {
-                    settings.relay = value;
+                match key.as_str() {
+                    "relay" => settings.relay = value,
+                    "auto_approve" => settings.auto_approve = truthy(&value),
+                    _ => {}
                 }
             }
         }
@@ -62,10 +71,23 @@ impl Settings {
 
     fn serialise(&self) -> String {
         format!(
-            "# Sideband. Written by the app; safe to edit or delete.\nrelay = {}\n",
-            self.relay.trim()
+            "# Sideband. Written by the app; safe to edit or delete.\nrelay = {}\nauto_approve = {}\n",
+            self.relay.trim(),
+            self.auto_approve,
         )
     }
+}
+
+/// What counts as a yes in the file.
+///
+/// Only these. Anything else, including an empty value or something typed by
+/// hand that nearly means yes, leaves the prompt in place: the cost of reading
+/// a stray word as "let anyone in" is far higher than the cost of asking.
+fn truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "yes" | "on" | "1"
+    )
 }
 
 /// `%APPDATA%\Sideband\settings`, or nowhere if the profile has no such thing.
@@ -93,10 +115,43 @@ fn parse(text: &str) -> Vec<(String, String)> {
 mod tests {
     use super::*;
 
+    /// One setting out of a serialised file.
+    ///
+    /// The tests below ask for the key they are about rather than comparing
+    /// the whole file, because every one of them broke the day a second
+    /// setting was added, and none of them was actually about how many
+    /// settings there are.
+    fn value(text: &str, key: &str) -> Option<String> {
+        parse(text).into_iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    #[test]
+    fn auto_approve_survives_a_round_trip() {
+        let on = Settings { relay: String::new(), auto_approve: true }.serialise();
+        assert_eq!(value(&on, "auto_approve").as_deref(), Some("true"));
+
+        let off = Settings::default().serialise();
+        assert_eq!(value(&off, "auto_approve").as_deref(), Some("false"));
+    }
+
+    #[test]
+    fn only_an_unambiguous_yes_turns_the_prompt_off() {
+        // The failure to avoid is a hand-edited file letting someone in. Every
+        // value that is not clearly a yes has to read as a no, including the
+        // ones that look like they were meant to be one.
+        for yes in ["true", "yes", "on", "1", "TRUE", " Yes "] {
+            assert!(truthy(yes), "{yes:?} should enable it");
+        }
+        for no in ["false", "no", "off", "0", "", "y", "sure", "true-ish", "2"] {
+            assert!(!truthy(no), "{no:?} must not enable it");
+        }
+    }
+
     #[test]
     fn a_saved_relay_reads_back_the_same() {
-        let written = Settings { relay: "https://relay.example/".into() }.serialise();
-        assert_eq!(parse(&written), vec![("relay".into(), "https://relay.example/".into())]);
+        let written =
+            Settings { relay: "https://relay.example/".into(), ..Default::default() }.serialise();
+        assert_eq!(value(&written, "relay").as_deref(), Some("https://relay.example/"));
     }
 
     #[test]
@@ -104,15 +159,17 @@ mod tests {
         // Clearing the box is a choice, serve locally, and has to survive a
         // restart just as a URL does.
         let written = Settings::default().serialise();
-        assert_eq!(parse(&written), vec![("relay".into(), String::new())]);
+        assert_eq!(value(&written, "relay").as_deref(), Some(""));
     }
 
     #[test]
     fn urls_keep_the_characters_that_matter() {
         // A relay URL contains `=` in a query string often enough to be worth
         // checking that only the first one splits the line.
-        let written = Settings { relay: "https://r.example/x?a=1&b=2".into() }.serialise();
-        assert_eq!(parse(&written)[0].1, "https://r.example/x?a=1&b=2");
+        let written =
+            Settings { relay: "https://r.example/x?a=1&b=2".into(), ..Default::default() }
+                .serialise();
+        assert_eq!(value(&written, "relay").as_deref(), Some("https://r.example/x?a=1&b=2"));
     }
 
     #[test]
@@ -134,10 +191,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let file = dir.join("Sideband").join("settings");
 
-        Settings { relay: "https://r.example/".into() }.save_to(&file);
+        Settings { relay: "https://r.example/".into(), ..Default::default() }.save_to(&file);
 
         let text = std::fs::read_to_string(&file).expect("the file should exist");
-        assert_eq!(parse(&text), vec![("relay".into(), "https://r.example/".into())]);
+        assert_eq!(value(&text, "relay").as_deref(), Some("https://r.example/"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

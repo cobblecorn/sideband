@@ -48,6 +48,18 @@ fn main() {
         eprintln!("\n  error: {e}");
         std::process::exit(1);
     }
+
+    // Returning from `main` would be enough if every thread were ours, and it
+    // is not. Capture, encode and audio each sit inside vendor DLLs, and a
+    // thread parked in one of those at exit can hold the loader long enough
+    // that the process outlives its own window: nothing on screen, no stream,
+    // still resident, still holding the encoder session and the audio client.
+    // The graceful wind down has already happened by this point, in `on_exit`
+    // for the window and at the end of the session for the command line. This
+    // is only the guarantee that nothing is left behind afterwards.
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(0);
 }
 
 /// Reuses the console of whatever launched us, if there was one.
@@ -236,6 +248,10 @@ where
     F: FnOnce(Arc<Session>) -> Result<(), String>,
 {
     let session = Arc::new(Session::default());
+    // One setting, however it was turned on. Someone who ticked the box in the
+    // window and then ran the command line would otherwise be asked to approve
+    // a viewer by a prompt they had already said they did not want.
+    session.set_auto_approve(settings::Settings::load().auto_approve);
     let input = stdin_lines();
 
     let printer = {

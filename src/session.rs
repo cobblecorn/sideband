@@ -59,6 +59,16 @@ pub struct Session {
     /// yes.
     approval: Mutex<Option<bool>>,
 
+    /// Whether holding the code is enough on its own.
+    ///
+    /// The prompt exists because a code can be forwarded, shoulder-read or
+    /// guessed at, and the host is the only one who knows whether the person
+    /// asking is the person they sent it to. Turning it off trades that check
+    /// for not having to be at the keyboard when someone arrives, which is a
+    /// reasonable trade to want and not one to make on somebody's behalf, so
+    /// it is off until asked for.
+    auto_approve: AtomicBool,
+
     /// Held mid-session: the connection stays up and the viewer keeps the
     /// last frame on screen, rather than being disconnected and having to
     /// rejoin with a new code.
@@ -104,6 +114,7 @@ impl Default for Session {
             audio_packets: AtomicU64::new(0),
             video_bytes: AtomicU64::new(0),
             approval: Mutex::new(None),
+            auto_approve: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             mic_on: AtomicBool::new(false),
             mic_available: AtomicBool::new(false),
@@ -208,6 +219,14 @@ impl Session {
     }
 
     /// Asks the host to let a viewer in, describing who is asking.
+    pub fn auto_approve(&self) -> bool {
+        self.auto_approve.load(Ordering::Relaxed)
+    }
+
+    pub fn set_auto_approve(&self, on: bool) {
+        self.auto_approve.store(on, Ordering::Relaxed);
+    }
+
     pub fn request_approval(&self, viewer: &str) {
         if let Ok(mut a) = self.approval.lock() {
             *a = None;
@@ -422,6 +441,18 @@ mod tests {
         assert_eq!(s.phase(), Phase::Preparing("gathering".into()));
         s.fail("nope");
         assert_eq!(s.phase(), Phase::Failed("nope".into()));
+    }
+
+    #[test]
+    fn a_session_asks_before_letting_anyone_in_unless_told_not_to() {
+        // The default matters more than the feature. Anything that reads a
+        // missing or unreadable setting as "let them in" would hand out the
+        // screen on a typo.
+        let s = Session::default();
+        assert!(!s.auto_approve(), "asking is the default");
+
+        s.set_auto_approve(true);
+        assert!(s.auto_approve());
     }
 
     #[test]

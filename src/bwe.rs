@@ -77,10 +77,41 @@ const LOSS_CONGESTED: f64 = 0.10;
 /// Below this, the path is considered calm enough to probe upward.
 const LOSS_CALM: f64 = 0.02;
 
-/// Per-second increase once the path has proved itself. Twelve percent reaches
-/// the ceiling from the starting rate in about a dozen seconds, which is slow
-/// enough not to be the thing that causes a queue to build.
-const RAMP: f64 = 1.12;
+/// What the rate is multiplied by each second spent in the band between
+/// `LOSS_CALM` and `LOSS_CONGESTED`.
+///
+/// Holding station in that band, which is what this used to do, assumes
+/// something will come along and resolve it. Nothing will: the loss is not
+/// heavy enough to trip the congestion rule and not light enough to be
+/// invisible, so the session sits at a rate that is quietly shredding four or
+/// five percent of its packets for as long as it lasts. Bleeding down slowly
+/// finds the rate that stops losing without lurching away from a link that
+/// was nearly fine.
+const LOSS_BLEED: f64 = 0.95;
+
+/// How far below the actual send rate a receiver's estimate has to sit before
+/// it counts as the receiver disagreeing with us, rather than as the ordinary
+/// lag of an average that trails its input.
+const ESTIMATE_BELOW: f64 = 0.85;
+
+/// How many consecutive seconds of that before the rate comes down.
+///
+/// Three. One is indistinguishable from the estimate lagging a burst, and at
+/// a one second control interval two is still within reach of a burst that
+/// straddles a report boundary. A receiver still saying the same thing on the
+/// third consecutive second is not lagging, it is disagreeing.
+const BELOW_BEFORE_BRAKE: u32 = 3;
+
+/// Per-second increase once the path has proved itself.
+///
+/// Deliberately unhurried, because overshoot here is not self-correcting. A
+/// stream that outruns its link loses packets, and loss too large for NACK to
+/// repair needs a keyframe, which this pipeline cannot send (see
+/// `stream::KEYFRAME_INTERVAL`). So the viewer does not recover a second
+/// later, they stay frozen. Reaching a good link's ceiling twenty seconds
+/// later costs a little sharpness for a little while; overshooting a weak one
+/// costs the session.
+const RAMP: f64 = 1.08;
 
 /// How many consecutive calm seconds before probing upward at all. One clean
 /// report right after a loss burst usually means the burst is between reports,
@@ -144,7 +175,7 @@ const PROVEN_DECAY: f64 = 0.97;
 /// overshoot cap bounds any single step to what the link has actually carried,
 /// and because a single second of trouble resets it to gentle.
 const RAMP_ACCELERATION: f64 = 0.04;
-const RAMP_MAX: f64 = 1.40;
+const RAMP_MAX: f64 = 1.20;
 
 /// What to leave for audio when treating a receiver estimate as a ceiling.
 /// REMB covers everything on the transport, and the number we control is the
@@ -455,6 +486,11 @@ pub struct Controller {
     /// The previous receiver estimate, because the direction it moved is what
     /// carries the meaning, see `update`.
     last_estimate: Option<u32>,
+    /// Consecutive seconds the receiver's estimate has sat below what is
+    /// actually being sent. The counterpart to `last_estimate`: one catches an
+    /// estimate falling, this one catches an estimate that has already fallen
+    /// and stayed there.
+    below: u32,
 }
 
 impl Controller {
@@ -467,6 +503,7 @@ impl Controller {
             calm: 0,
             proven: 0,
             last_estimate: None,
+            below: 0,
         }
     }
 
@@ -521,15 +558,51 @@ impl Controller {
             let for_video = estimate.saturating_sub(AUDIO_ALLOWANCE);
             let video_sent = sending.saturating_sub(AUDIO_ALLOWANCE).max(1);
 
-            if fell && for_video < self.bitrate {
-                // The receiver has seen its queue building and told us what it
-                // thinks the path is worth. That is the earliest warning
-                // available, so it is obeyed on the spot.
+            // Two ways to be told the path is worth less than we are
+            // spending, and both are needed.
+            //
+            // A *falling* estimate is the early warning: the receiver has just
+            // seen its queue building. It is obeyed on the spot.
+            //
+            // A *settled* one is the case this used to miss entirely, and it
+            // is the one that ends sessions. An estimate only has to fall
+            // once; after that it sits there, low and steady, and every
+            // second the direction test asks "has it fallen since last time?"
+            // the answer is no. So the old rule neither braked nor climbed,
+            // and the stream held a rate the receiver had already said, and
+            // was still saying, the path could not carry. On a link half the
+            // size of the target that is a picture that freezes within
+            // seconds and never comes back.
+            // A rising estimate is a receiver catching up with us, which is
+            // exactly what a healthy one does while the rate climbs, so it
+            // never counts against us however far below it currently sits.
+            let rising = self.last_estimate.is_some_and(|previous| estimate > previous);
+            if !rising && for_video < scale_raw(video_sent, ESTIMATE_BELOW) {
+                self.below += 1;
+            } else {
+                self.below = 0;
+            }
+
+            let settled_low = self.below >= BELOW_BEFORE_BRAKE;
+
+            if (fell || settled_low) && for_video < self.bitrate {
                 self.bitrate = for_video.max(MIN_BITRATE);
                 trouble = true;
             } else if !fell && for_video as f64 >= video_sent as f64 * ESTIMATE_HEADROOM {
                 calm = true;
             }
+        } else {
+            // No estimate, or the encoder was not spending its budget, so
+            // there is nothing to compare and the run starts again.
+            //
+            // Without this reset the count was not consecutive at all, it
+            // merely accumulated across whichever scattered seconds happened
+            // to qualify, and the next busy second cashed them all in at once.
+            // Measured on loopback with zero loss, zero NACKs and zero picture
+            // loss: a mostly still window, a handful of quiet seconds, then
+            // one 2 Mbit/s burst, and the rate collapsed from 2.5 Mbit/s to
+            // the floor. Three seconds has to mean three in a row.
+            self.below = 0;
         }
 
         match fb.loss {
@@ -537,9 +610,15 @@ impl Controller {
                 self.bitrate = scale(self.bitrate, (1.0 - 0.5 * loss).max(MAX_DECREASE));
                 trouble = true;
             }
-            // Some loss, but the kind NACK repairs. Hold where we are rather
-            // than climbing into it.
-            Some(loss) if loss > LOSS_CALM => trouble = true,
+            // Enough loss to be doing damage, not enough to look like
+            // congestion. NACK repairs some of it, and the retransmissions are
+            // themselves extra traffic on a link already dropping packets, so
+            // holding station here is not the neutral choice it looks like.
+            // Come down gently until it stops.
+            Some(loss) if loss > LOSS_CALM => {
+                self.bitrate = scale(self.bitrate, LOSS_BLEED);
+                trouble = true;
+            }
             Some(_) => calm = true,
             // No report arrived. Silence is not evidence of calm.
             None => {}
@@ -771,15 +850,33 @@ mod tests {
     }
 
     #[test]
-    fn mild_loss_holds_rather_than_climbing() {
-        // A few percent is what wireless does at a rate it carries perfectly
-        // well, and NACK repairs it. Treating that as congestion would ratchet
-        // a good connection down to nothing.
+    fn mild_loss_bleeds_down_gently_and_recovers() {
+        // This band used to hold station, on the reasoning that a few percent
+        // is what wireless does at a rate it carries perfectly well and NACK
+        // repairs it invisibly. Half of that is true. The half that is not:
+        // holding assumes something will come along and resolve it, and
+        // nothing will, so the session settles at a rate that quietly sheds
+        // four or five percent of its packets for as long as it lasts, with
+        // the retransmissions adding load to a link already dropping things.
+        // A pipeline that cannot send a keyframe does not get to sit there.
         let mut c = Controller::new(4_000_000, 60);
         for _ in 0..10 {
             c.update(&losing(0.05, 4_000_000));
         }
-        assert_eq!(c.target().bitrate, 4_000_000, "neither climbs nor collapses");
+        let bled = c.target().bitrate;
+        assert!(bled < 4_000_000, "should have come down, stayed at {bled}");
+        assert!(bled > 2_000_000, "gently, not a collapse, got {bled}");
+
+        // And it is a bleed, not a ratchet: once the loss stops, the rate
+        // climbs back rather than being stuck where the bad minute left it.
+        for _ in 0..10 {
+            c.update(&losing(0.0, bled));
+        }
+        assert!(
+            c.target().bitrate > bled,
+            "should climb again once the path is clean, got {}",
+            c.target().bitrate
+        );
     }
 
     #[test]
@@ -829,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn an_estimate_that_is_still_rising_never_brakes() {
+    fn a_burst_the_estimate_has_not_caught_up_with_yet_does_not_brake() {
         // The regression this guards, measured on a loopback connection that
         // could not possibly have been congested: a browser's estimate is a
         // smoothed average of what it has been receiving, so it sits below any
@@ -839,11 +936,56 @@ mod tests {
         let mut c = Controller::new(2_000_000, 60);
         c.update(&estimating(900_000, 400_000));
 
-        for _ in 0..4 {
-            // The estimate climbing, the output spiking above it.
-            c.update(&estimating(1_000_000, 1_400_000));
+        // A burst, with the estimate climbing after it. Rising is the tell: a
+        // receiver catching up is not a receiver objecting.
+        for estimate in [1_000_000, 1_150_000] {
+            c.update(&estimating(estimate, 1_400_000));
         }
         assert!(c.target().bitrate >= 2_000_000, "got {}", c.target().bitrate);
+    }
+
+    #[test]
+    fn scattered_low_seconds_do_not_add_up_to_a_brake() {
+        // Measured on loopback, with zero loss and zero picture loss: a mostly
+        // still window spends most of its seconds below the threshold that
+        // makes an estimate worth reading at all, and if those seconds still
+        // counted towards the brake, the next busy second cashed in a run that
+        // was never consecutive. The rate fell from 2.5 Mbit/s to the floor on
+        // a connection that could not possibly have been congested.
+        let mut c = Controller::new(2_500_000, 60);
+
+        for _ in 0..6 {
+            // Below, but not pushing: nothing was being asked of the link.
+            c.update(&estimating(480_000, 100_000));
+        }
+        // One busy second. It must be judged on its own, not on the six.
+        c.update(&estimating(480_000, 2_000_000));
+
+        assert!(
+            c.target().bitrate >= 2_000_000,
+            "a still window then one burst is not congestion, got {}",
+            c.target().bitrate
+        );
+    }
+
+    #[test]
+    fn an_estimate_that_has_settled_below_the_send_rate_brakes() {
+        // The counterpart, and the failure that ended real sessions. An
+        // estimate only has to fall once. After that it sits there, low and
+        // flat, and a rule that asks "did it fall since last time?" answers no
+        // for ever, so the stream holds a rate the receiver is still saying
+        // the path cannot carry. The viewer freezes within seconds and never
+        // comes back, because this pipeline has no working keyframe to repair
+        // them with.
+        let mut c = Controller::new(6_000_000, 60);
+        for _ in 0..4 {
+            c.update(&estimating(2_000_000, 6_000_000));
+        }
+        assert!(
+            c.target().bitrate <= 2_000_000,
+            "should have come down to what the receiver reported, got {}",
+            c.target().bitrate
+        );
     }
 
     #[test]

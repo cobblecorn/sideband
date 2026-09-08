@@ -349,6 +349,14 @@ async fn destroy_session(relay: &str, ticket: &Ticket) {
 /// exactly the person who should not get another go at it, starting again
 /// issues a fresh code.
 async fn approved(answer: &str, session: &Arc<Session>) -> bool {
+    // Asked for explicitly, so there is nobody to ask. The viewer is still
+    // named in the read-out rather than let in silently: not having to answer
+    // is the point, not being unable to see who arrived.
+    if session.auto_approve() {
+        session.note(format!("let {} in without asking", describe_viewer(answer)));
+        return true;
+    }
+
     session.request_approval(&describe_viewer(answer));
 
     let deadline = Instant::now() + APPROVAL_TIMEOUT;
@@ -551,6 +559,23 @@ async fn pump<P: webrtc::peer_connection::PeerConnection>(
     };
 
     stop.store(true, Ordering::Relaxed);
+
+    // Dropped before the joins below, and that ordering is the whole point.
+    //
+    // Both threads check `stop` at the top of their loop, but a thread parked
+    // inside `blocking_send` on a full queue never reaches the top of its loop
+    // again. The queues are small and this loop has just stopped draining
+    // them, so that is the *likely* state at this moment, not an unlucky one.
+    // Closing the receiving ends turns the block into the send error both
+    // threads already treat as "shutting down".
+    //
+    // Without it, `join` waits for a thread that is waiting for us, and the
+    // process survives its own window: no UI, no stream, still running, still
+    // holding the capture and the encoder session. Every leftover `sideband`
+    // in Task Manager came from here.
+    drop(video_rx);
+    drop(audio_rx);
+
     let _ = video_thread.join();
 
     // The audio thread's result is read, not discarded. It ending early is
