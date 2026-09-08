@@ -69,6 +69,20 @@ pub struct Session {
     /// Peak since the last read, as a fraction of full scale times 1000.
     mic_peak: AtomicU32,
 
+    /// The same measure for the shared application's own audio.
+    ///
+    /// Worth showing for the reason the mic meter is worth showing, only more
+    /// so: process loopback delivers perfectly paced packets whether or not
+    /// the application is making any sound, so a stream carrying nothing but
+    /// silence looks identical from here to one carrying a game. Without a
+    /// level there is no way to tell "this application is quiet" from "we are
+    /// listening to the wrong thing", and both arrive as the viewer saying
+    /// they cannot hear anything.
+    app_peak: AtomicU32,
+    /// Whether the loopback capture is actually open. False while a target
+    /// refuses to open, which is the one case where silence is our fault.
+    app_audio_ok: AtomicBool,
+
     /// What the encoder is actually running at, in kbit/s, and the frame rate
     /// its rate control is budgeting for. These are the *applied* figures, not
     /// the controller's wish: if a driver refuses a rate change, the read-out
@@ -94,6 +108,8 @@ impl Default for Session {
             mic_on: AtomicBool::new(false),
             mic_available: AtomicBool::new(false),
             mic_peak: AtomicU32::new(0),
+            app_peak: AtomicU32::new(0),
+            app_audio_ok: AtomicBool::new(true),
             video_kbps: AtomicU32::new(0),
             video_fps: AtomicU32::new(0),
         }
@@ -255,6 +271,32 @@ impl Session {
             .store((level.clamp(0.0, 1.0) * 1000.0) as u32, Ordering::Relaxed);
     }
 
+    /// Peak level of the shared application's own audio, 0.0-1.0, excluding
+    /// the microphone. The mic is deliberately left out: mixing it in would
+    /// mean talking over a silent game made the game look like it was
+    /// working.
+    pub fn app_peak(&self) -> f32 {
+        self.app_peak.load(Ordering::Relaxed) as f32 / 1000.0
+    }
+
+    pub fn set_app_peak(&self, level: f32) {
+        self.app_peak
+            .store((level.clamp(0.0, 1.0) * 1000.0) as u32, Ordering::Relaxed);
+    }
+
+    /// False while the application's audio could not be captured at all, as
+    /// opposed to captured and silent.
+    pub fn app_audio_ok(&self) -> bool {
+        self.app_audio_ok.load(Ordering::Relaxed)
+    }
+
+    pub fn set_app_audio_ok(&self, ok: bool) {
+        self.app_audio_ok.store(ok, Ordering::Relaxed);
+        if !ok {
+            self.app_peak.store(0, Ordering::Relaxed);
+        }
+    }
+
     /// Records what the encoder settled on for this second.
     pub fn set_quality(&self, bits_per_second: u32, fps: u32) {
         self.video_kbps.store(bits_per_second / 1000, Ordering::Relaxed);
@@ -333,6 +375,33 @@ mod tests {
         s.note_video(500);
         s.note_audio();
         assert_eq!(s.counters(), (2, 1, 1500));
+    }
+
+    #[test]
+    fn app_peak_round_trips_and_clamps() {
+        let s = Session::default();
+        s.set_app_peak(0.25);
+        assert!((s.app_peak() - 0.25).abs() < 0.002);
+
+        s.set_app_peak(3.0);
+        assert_eq!(s.app_peak(), 1.0, "over-range input is clamped, not wrapped");
+    }
+
+    #[test]
+    fn audio_starts_assumed_working_and_a_failure_zeroes_the_level() {
+        // The meter must not keep showing the last level a dead capture
+        // produced: a frozen bar reads as "still working", which is the exact
+        // wrong answer to the only question it is there to answer.
+        let s = Session::default();
+        assert!(s.app_audio_ok(), "nothing has failed yet");
+
+        s.set_app_peak(0.8);
+        s.set_app_audio_ok(false);
+        assert!(!s.app_audio_ok());
+        assert_eq!(s.app_peak(), 0.0, "a dead capture reads as silent, not as loud");
+
+        s.set_app_audio_ok(true);
+        assert!(s.app_audio_ok());
     }
 
     #[test]

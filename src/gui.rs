@@ -57,6 +57,9 @@ struct Source {
     exe: String,
     title: String,
     path: String,
+    /// Carried through from the enumeration: this window's audio cannot be
+    /// captured. See `sources::Source::frame_hosted`.
+    frame_hosted: bool,
 }
 
 pub struct App {
@@ -167,7 +170,13 @@ impl App {
         if let Ok(list) = sources::list() {
             self.sources = list
                 .into_iter()
-                .map(|s| Source { pid: s.pid, exe: s.exe, title: s.title, path: s.path })
+                .map(|s| Source {
+                    pid: s.pid,
+                    exe: s.exe,
+                    title: s.title,
+                    path: s.path,
+                    frame_hosted: s.frame_hosted,
+                })
                 .collect();
         }
 
@@ -631,6 +640,8 @@ impl App {
                             .size(11.0),
                     );
                     ui.add_space(6.0);
+                    app_meter(ui, &sess);
+                    ui.add_space(4.0);
                     mic_meter(ui, &sess);
                 }
             }
@@ -1008,15 +1019,45 @@ fn source_row(
         egui::FontId::proportional(12.0),
         INK,
     );
+    // A packaged application whose real process could not be found will
+    // stream a perfect picture and total silence, and nothing downstream can
+    // tell that apart from an application that is merely quiet. Saying so
+    // here, before it is picked, is the only honest place for it.
+    let (subtitle, colour) = if src.frame_hosted {
+        ("audio cannot be captured for this app".to_owned(), BAD)
+    } else {
+        (truncate(&src.title, 70), MUTED)
+    };
     ui.painter().text(
         left + egui::vec2(0.0, 17.0),
         egui::Align2::LEFT_TOP,
-        truncate(&src.title, 70),
+        subtitle,
         egui::FontId::proportional(10.0),
-        MUTED,
+        colour,
     );
 
     response
+}
+
+/// The shared application's own level.
+///
+/// The packet counter above it only ever proves the stream is running, never
+/// that it carries anything: process loopback is gap-filled with synthesised
+/// silence, so a muted application and a loud one send exactly the same number
+/// of packets at exactly the same rate. This is the one place that separates
+/// them, and it is the first thing to look at when a viewer says they cannot
+/// hear the game.
+fn app_meter(ui: &mut egui::Ui, session: &Session) {
+    if !session.app_audio_ok() {
+        ui.label(RichText::new("cannot capture this app's audio").color(BAD).size(10.0));
+        return;
+    }
+
+    let peak = session.app_peak();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("app").color(FAINT).size(10.0));
+        meter_bar(ui, peak, 150.0);
+    });
 }
 
 fn mic_meter(ui: &mut egui::Ui, session: &Session) {
@@ -1029,11 +1070,23 @@ fn mic_meter(ui: &mut egui::Ui, session: &Session) {
     // A level meter rather than just a state: a mic that is on and reading
     // nothing is the failure people otherwise discover mid-conversation.
     let peak = if on { session.mic_peak() } else { 0.0 };
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width().min(180.0), 5.0), egui::Sense::hover());
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("mic").color(FAINT).size(10.0));
+        meter_bar(ui, peak, 150.0);
+    });
+}
+
+fn meter_bar(ui: &mut egui::Ui, peak: f32, width: f32) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width().min(width), 5.0),
+        egui::Sense::hover(),
+    );
     let radius = egui::CornerRadius::same(2);
     ui.painter().rect_filled(rect, radius, SURFACE_HI);
     if peak > 0.0 {
+        // A floor on the drawn width, not on the value: quiet audio is still
+        // audible audio, and a bar too short to see reads as nothing at all,
+        // which is the one thing this is here to rule out.
         let mut filled = rect;
         filled.set_width(rect.width() * peak.clamp(0.02, 1.0));
         ui.painter().rect_filled(filled, radius, ACCENT);

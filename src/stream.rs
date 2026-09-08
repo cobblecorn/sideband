@@ -552,7 +552,14 @@ async fn pump<P: webrtc::peer_connection::PeerConnection>(
 
     stop.store(true, Ordering::Relaxed);
     let _ = video_thread.join();
-    let _ = audio_thread.join();
+
+    // The audio thread's result is read, not discarded. It ending early is
+    // survivable, the stream keeps its picture, but it is the exact shape of
+    // "the viewer says they cannot hear anything" and it has to leave a trace
+    // somewhere rather than being thrown away here.
+    if let Ok(Err(e)) = audio_thread.join() {
+        session.note(format!("audio stopped: {e}"));
+    }
 
     if result.is_ok() {
         session.set_phase(Phase::Ended);

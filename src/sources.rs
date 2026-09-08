@@ -10,14 +10,14 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 
 use windows::core::BOOL;
-use windows::Win32::Foundation::{HWND, LPARAM, RECT, TRUE};
+use windows::Win32::Foundation::{FALSE, HWND, LPARAM, RECT, TRUE};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible,
+    EnumChildWindows, EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextLengthW,
+    GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
 };
 
 #[derive(Clone)]
@@ -33,6 +33,10 @@ pub struct Source {
     /// just the file name and is what gets shown.
     pub path: String,
     pub area: i64,
+    /// The window is drawn by the frame host on behalf of a packaged
+    /// application we could not identify, so its audio cannot be captured.
+    /// See `hosted_app`. Video is unaffected.
+    pub frame_hosted: bool,
 }
 
 unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -67,6 +71,8 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         if pid == 0 {
             return TRUE;
         }
+        // Not necessarily the process that makes the sound. See `hosted_app`.
+        let pid = hosted_app(hwnd).unwrap_or(pid);
 
         let mut rect = RECT::default();
         let area = if GetWindowRect(hwnd, &mut rect).is_ok() {
@@ -81,10 +87,86 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
             .next()
             .unwrap_or("?")
             .to_string();
-        out.push(Source { hwnd, pid, title, exe, path, area });
+        // Still the frame host means the resolution above found nothing, and
+        // the process actually making the sound is one we cannot name.
+        let frame_hosted = exe.eq_ignore_ascii_case(FRAME_HOST);
+        out.push(Source { hwnd, pid, title, exe, path, area, frame_hosted });
     }
 
     TRUE
+}
+
+/// The class of the window a packaged application draws into.
+const CORE_WINDOW: &str = "Windows.UI.Core.CoreWindow";
+
+/// The process that owns a packaged application's frame.
+pub const FRAME_HOST: &str = "ApplicationFrameHost.exe";
+
+/// The process actually behind a window, where that is not the process that
+/// owns it.
+///
+/// A packaged ("Store") application does not own its own frame. The visible,
+/// titled, enumerable window belongs to `ApplicationFrameHost.exe`, and the
+/// application runs in a separate process which is a *sibling* of the frame
+/// host, not a child of it.
+///
+/// Video capture does not care, the frame host's window is showing the
+/// application. Audio does, and badly: process loopback scoped to the frame
+/// host's tree captures a process that never makes a sound, so the viewer gets
+/// a perfect picture in total silence. Nothing reports this. The loopback API
+/// accepts any process id at all, including one that does not exist, and
+/// answers with an unbroken stream of silent buffers, so there is no error to
+/// notice and no way to tell this apart from an application that happens to be
+/// quiet.
+///
+/// Where the frame exposes the application's `Windows.UI.Core.CoreWindow` as
+/// a child, that window's process is the answer. It does not always: on
+/// Windows 11 the frame is routinely childless when enumerated from outside
+/// the process, and then there is nothing here to find. Callers are told as
+/// much through `Source::frame_hosted`, because a source whose audio silently
+/// cannot work is worth saying out loud rather than leaving to be discovered
+/// by a viewer who cannot hear anything.
+///
+/// Returns `None` when there is no such window, which is also the ordinary
+/// case for an ordinary application.
+fn hosted_app(frame: HWND) -> Option<u32> {
+    let mut found = 0u32;
+    unsafe {
+        let _ = EnumChildWindows(
+            Some(frame),
+            Some(core_window_owner),
+            LPARAM(&mut found as *mut u32 as isize),
+        );
+    }
+    (found != 0).then_some(found)
+}
+
+unsafe extern "system" fn core_window_owner(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let out = unsafe { &mut *(lparam.0 as *mut u32) };
+
+    unsafe {
+        if class_of(hwnd).as_deref() != Some(CORE_WINDOW) {
+            return TRUE;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 {
+            return TRUE;
+        }
+        *out = pid;
+    }
+
+    // Found it; there is no second answer worth waiting for.
+    FALSE
+}
+
+fn class_of(hwnd: HWND) -> Option<String> {
+    let mut buf = [0u16; 64];
+    let len = unsafe { GetClassNameW(hwnd, &mut buf) };
+    if len <= 0 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buf[..len as usize]))
 }
 
 /// Whether this is part of the desktop shell rather than an application.
@@ -101,13 +183,10 @@ fn is_shell_window(hwnd: HWND) -> bool {
         "Button",
     ];
 
-    let mut buf = [0u16; 64];
-    let len = unsafe { GetClassNameW(hwnd, &mut buf) };
-    if len <= 0 {
-        return false;
+    match class_of(hwnd) {
+        Some(class) => SHELL_CLASSES.contains(&class.as_str()),
+        None => false,
     }
-    let class = String::from_utf16_lossy(&buf[..len as usize]);
-    SHELL_CLASSES.contains(&class.as_str())
 }
 
 fn exe_path(pid: u32) -> String {

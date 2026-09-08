@@ -77,6 +77,16 @@ and 30 fps, low enough for almost any home link to carry from the first frame, a
 climbs to 1080p60 at 10 Mbit/s over the next ten to twenty seconds if the viewer
 keeps reporting a clean path. If they stop, it comes back down quickly.
 
+**"They cannot hear it"** - watch the `app` level while the stream runs. Process
+loopback delivers evenly paced packets whether or not the application is making
+a sound, and it accepts any process at all without complaint, so a packet count
+alone never proves anything is being heard. The level does. If it sits at zero
+while the application is plainly audible to you, the audio is being taken from
+the wrong process; if it moves, the audio is leaving this machine and the
+problem is at the other end. Note that many games mute themselves when they are
+not the focused window, which reads as silence here and is the application doing
+it, not Sideband.
+
 When a stream misbehaves and you want to know why, `SIDEBAND_DEBUG_RATE=1` prints a
 line a second with what the viewer actually reported and what was decided from it.
 
@@ -265,4 +275,10 @@ cargo test
   on.
 - **Resolution never changes**, only bitrate and frame rate. A new resolution needs a
   new SPS, and this stream deliberately sends parameter sets exactly once.
+- **Packaged ("Store") applications may have no capturable audio.** Their window
+  belongs to `ApplicationFrameHost.exe` while the application runs in a separate
+  process that is not below it, so audio scoped to the window's process tree
+  gets nothing. Sideband marks those entries in the list. Where the application
+  also has a window of its own, pick that one instead. The picture is never
+  affected.
 - **Windows only, and NVIDIA only.**

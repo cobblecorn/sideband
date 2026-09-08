@@ -221,7 +221,8 @@ fn stdin_lines() -> std::sync::mpsc::Receiver<String> {
 fn print_sources(list: &[sources::Source]) {
     println!();
     for (i, s) in list.iter().enumerate() {
-        println!("  {:>3}  {:<24} pid {}", i + 1, s.exe, s.pid);
+        let note = if s.frame_hosted { "  (no audio, see README)" } else { "" };
+        println!("  {:>3}  {:<24} pid {}{note}", i + 1, s.exe, s.pid);
     }
     println!("
   Type a number to share that one instead.
@@ -346,6 +347,15 @@ where
                         } else {
                             String::new()
                         };
+                        // The packet count says the audio stream is running,
+                        // never that it carries anything: silence is gap
+                        // filled and paces identically. This is the figure
+                        // that answers "why can she not hear the game".
+                        let app = if !session.app_audio_ok() {
+                            "  app audio UNAVAILABLE".to_owned()
+                        } else {
+                            format!("  app {:.0}%", session.app_peak() * 100.0)
+                        };
                         // The quality figure is what the viewer's connection
                         // turned out to support, which is the number worth
                         // watching when a stream is struggling.
@@ -355,7 +365,7 @@ where
                             }
                             None => String::new(),
                         };
-                        println!("  {frames} video / {packets} audio sent{quality}{mic}");
+                        println!("  {frames} video / {packets} audio sent{quality}{app}{mic}");
                     }
                 }
 
@@ -404,7 +414,8 @@ fn pick_source() -> Result<u32, String> {
         } else {
             s.title.clone()
         };
-        println!("  {:>3}  {:<24} {:<45} pid {}", i + 1, s.exe, title, s.pid);
+        let note = if s.frame_hosted { "  (no audio)" } else { "" };
+        println!("  {:>3}  {:<24} {:<45} pid {}{note}", i + 1, s.exe, title, s.pid);
     }
 
     print!("

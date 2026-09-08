@@ -85,6 +85,9 @@ pub struct Capture {
     started: Instant,
     frames_written: u64,
     gap_frames: u64,
+    /// Loudest absolute sample seen since the last `take_peak`, before the
+    /// microphone is mixed in.
+    peak: u32,
 }
 
 impl Capture {
@@ -186,6 +189,7 @@ impl Capture {
                 started: Instant::now(),
                 frames_written: 0,
                 gap_frames: 0,
+                peak: 0,
             })
         }
     }
@@ -260,6 +264,14 @@ impl Capture {
                     std::slice::from_raw_parts(data as *const i16, samples).to_vec()
                 };
 
+                // Measured here, before the mix: this is the *application's*
+                // level, and the whole use of it is answering whether the
+                // application is making any sound. Talking into the mic must
+                // not make a silent game look live.
+                self.peak = self.peak.max(
+                    pcm.iter().map(|s| s.unsigned_abs() as u32).max().unwrap_or(0),
+                );
+
                 if let Some(m) = mic {
                     if m.is_on() {
                         mix_into(&mut pcm, &m.take(samples));
@@ -281,6 +293,16 @@ impl Capture {
 
             Ok(packets)
         }
+    }
+
+    /// Loudest sample captured since the last call, 0.0 to 1.0, and resets.
+    ///
+    /// Reset-on-read so the reading is "loudest in the last interval" rather
+    /// than "loudest ever", which would latch on one notification chime and
+    /// then claim everything was fine for the rest of the session.
+    fn take_peak(&mut self) -> f32 {
+        let peak = std::mem::take(&mut self.peak);
+        peak as f32 / i16::MAX as f32
     }
 
     /// Fraction of the recording that had to be synthesised because the
@@ -366,6 +388,27 @@ pub struct CaptureReport {
 /// application still starting up is picked up almost immediately.
 const REOPEN_AFTER: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// How often the application's level is published to the session.
+const PEAK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Why the loopback would not open, in terms of what to do about it.
+///
+/// The overwhelmingly common cause is elevation: a process running as
+/// administrator cannot be captured by a process that is not, and the raw
+/// `E_ACCESSDENIED` says nothing a person can act on.
+fn open_failure(session: &Session, e: &windows::core::Error) -> String {
+    let (exe, _) = session.source();
+    let what = if exe.is_empty() { "that application".to_owned() } else { exe };
+
+    if e.code() == windows::Win32::Foundation::E_ACCESSDENIED {
+        format!(
+            "no audio from {what}: it is running as administrator.              Start Sideband as administrator too, or the viewer hears silence."
+        )
+    } else {
+        format!("no audio from {what}: {e}")
+    }
+}
+
 /// Silence covering a stretch of wall-clock time in which there was no capture
 /// at all.
 ///
@@ -412,6 +455,10 @@ pub fn stream_opus(
         let mut cap: Option<Capture> = None;
         let mut listening: u32 = 0;
         let mut retry_at = Instant::now();
+        // Reported once per target rather than once per retry, which at
+        // `REOPEN_AFTER` would be a fresh notice twice a second forever.
+        let mut announced = false;
+        let mut reported_at = Instant::now();
 
         while !stop.load(Ordering::Relaxed) {
             let wanted = session.selected_source();
@@ -423,12 +470,27 @@ pub fn stream_opus(
                 // Dropped first, unconditionally.
                 cap = None;
                 match Capture::open(wanted) {
-                    Ok(opened) => cap = Some(opened),
-                    // Not announced to the person at the keyboard. The window
-                    // side reports a switch it could not make, and a process
-                    // that has a window but no audio endpoint yet is normal
-                    // for a moment after it launches.
-                    Err(_) => retry_at = began + REOPEN_AFTER,
+                    Ok(opened) => {
+                        cap = Some(opened);
+                        announced = false;
+                        session.set_app_audio_ok(true);
+                    }
+                    Err(e) => {
+                        retry_at = began + REOPEN_AFTER;
+                        session.set_app_audio_ok(false);
+                        // A process that has a window but no audio endpoint
+                        // yet is normal for the first moment after it
+                        // launches, so the retry is silent. What is not
+                        // acceptable is staying silent forever: an
+                        // application whose audio cannot be opened at all
+                        // streams perfectly paced silence, and without this
+                        // the first anyone hears of it is the viewer saying
+                        // they cannot hear anything.
+                        if !announced && wanted != 0 {
+                            session.note(open_failure(&session, &e));
+                            announced = true;
+                        }
+                    }
                 }
                 listening = wanted;
 
@@ -437,7 +499,37 @@ pub fn stream_opus(
             }
 
             match cap.as_mut() {
-                Some(c) => packets.extend(c.pump(None, &mut opus, mic.as_deref())?),
+                Some(c) => match c.pump(None, &mut opus, mic.as_deref()) {
+                    Ok(got) => {
+                        packets.extend(got);
+                        // On a timer rather than every pass: `pump` returns
+                        // about every 20 ms, and resetting the peak that often
+                        // would report the level of a single buffer instead of
+                        // the level of the moment.
+                        if reported_at.elapsed() >= PEAK_INTERVAL {
+                            session.set_app_peak(c.take_peak());
+                            reported_at = Instant::now();
+                        }
+                    }
+                    Err(_) => {
+                        // A capture that was working can be invalidated out
+                        // from under us: the default output device changing,
+                        // headphones being plugged in, or the target process
+                        // exiting all end the stream mid-session. Treating
+                        // that as fatal costs the viewer audio for the rest
+                        // of the call, and silently, because nothing reads
+                        // this thread's result. So it is dropped and reopened
+                        // on the same path a switch uses.
+                        cap = None;
+                        session.set_app_audio_ok(false);
+                        retry_at = Instant::now() + REOPEN_AFTER;
+                        // Not announced. Reopening normally succeeds within
+                        // the second, and a notice for every headphone swap
+                        // would be noise; `announced` is left as it is, so a
+                        // target that then refuses to reopen still gets its
+                        // one explanation.
+                    }
+                },
                 None => {
                     // Nothing to listen to. Keep the timeline moving anyway,
                     // so that when there is, it still lines up with the video.
