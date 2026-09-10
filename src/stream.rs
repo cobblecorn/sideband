@@ -177,9 +177,30 @@ async fn serve_local(pid: u32, port: u16, session: Arc<Session>) -> Result<(), S
         }
     };
 
-    if !approved(&answer, &session).await {
-        return Err("you turned that viewer away".into());
-    }
+    // An unanswered prompt puts the link back to waiting rather than ending
+    // the session. The peer connection has not taken this answer, so a later
+    // one is still perfectly acceptable to it, and the link on screen keeps
+    // working. See `APPROVAL_TIMEOUT` for why silence is not a refusal.
+    let answer = {
+        let mut answer = answer;
+        loop {
+            match approved(&answer, &session).await {
+                Decision::Allowed => break answer,
+                Decision::Refused => return Err("you turned that viewer away".into()),
+                Decision::Unanswered => {
+                    session.note(
+                        "nobody answered the prompt here, so that viewer was not let in.                          The same link still works: turn on auto admit if you are the one                          at the other end."
+                            .to_owned(),
+                    );
+                    session.set_phase(Phase::Waiting {
+                        code: None,
+                        link: format!("http://{}:{port}/v/{secret}", local_address()),
+                    });
+                    answer = answer_rx.recv().await.ok_or("signalling closed")?;
+                }
+            }
+        }
+    };
 
     session.preparing("connecting");
     webrtc.accept_answer(&answer).await?;
@@ -214,12 +235,19 @@ const UNREACHED_HINT: Duration = Duration::from_secs(40);
 /// code, so their retry has something current to answer.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(25);
 
-/// How many viewer attempts to sit through before giving up.
-const MAX_ATTEMPTS: usize = 3;
+/// How many failed viewer attempts in a row before giving up.
+///
+/// Counted in a row, and reset by anything that works, so a session left open
+/// all evening is not spending a budget it set aside at the start.
+const MAX_ATTEMPTS: usize = 5;
 
-/// How long the approval prompt waits before treating silence as a refusal.
-/// An unanswered prompt means nobody was at the keyboard, and the safe reading
-/// of that is no.
+/// How long the approval prompt waits before giving up on an answer.
+///
+/// Silence here is not a no. It used to be, and it ended the session, which is
+/// the wrong reading of by far the commonest case: one person with two devices,
+/// standing at the second one, with the prompt sitting on the first. Nobody was
+/// refused, nobody was there. The offer goes up again instead, under the same
+/// code, so walking back and pressing the button actually works.
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 
 async fn serve_relay(pid: u32, relay: String, session: Arc<Session>) -> Result<(), String> {
@@ -246,10 +274,20 @@ async fn relay_attempts(
     link: &str,
     session: Arc<Session>,
 ) -> Result<(), String> {
-    for attempt in 0..MAX_ATTEMPTS {
-        if attempt > 0 {
-            session.preparing("that attempt did not connect - offering again");
+    // Not a fixed number of attempts any more. The code lives as long as this
+    // loop does, and this loop lives until the host stops or too many attempts
+    // fail back to back.
+    let mut failures = 0usize;
+    let mut first = true;
+
+    while failures < MAX_ATTEMPTS {
+        if session.should_stop() {
+            return Ok(());
         }
+        if !first {
+            session.preparing("offering again - the same code still works");
+        }
+        first = false;
 
         let webrtc = net::connect(net::ice_servers()).await?;
         let keyframe = webrtc.keyframe_signal();
@@ -265,11 +303,27 @@ async fn relay_attempts(
             link: link.to_owned(),
         });
 
-        let answer = poll_answer(relay, ticket, &session).await?;
+        let answer = match poll_answer(relay, ticket, &session).await {
+            Ok(answer) => answer,
+            Err(e) if e == "cancelled" => return Ok(()),
+            // Nobody came before the relay's clock ran out. Publishing again
+            // restarts that clock, so the code on screen keeps working rather
+            // than quietly becoming a dead string of letters.
+            Err(_) => continue,
+        };
 
-        // Knowing the code is not enough. Someone has to say yes.
-        if !approved(&answer, &session).await {
-            return Err("you turned that viewer away".into());
+        // Knowing the code is not enough. Someone has to say yes, or have said
+        // in advance that they would.
+        match approved(&answer, &session).await {
+            Decision::Allowed => {}
+            Decision::Refused => return Err("you turned that viewer away".into()),
+            Decision::Unanswered => {
+                session.note(
+                    "nobody answered the prompt here, so that viewer was not let in.                      The same code still works: turn on auto admit if you are the one                      at the other end."
+                        .to_owned(),
+                );
+                continue;
+            }
         }
 
         session.preparing("connecting");
@@ -277,15 +331,35 @@ async fn relay_attempts(
 
         match tokio::time::timeout(CONNECT_TIMEOUT, webrtc.wait_connected()).await {
             Ok(()) => {
-                // Connected. Nothing about this session needs to remain
-                // fetchable, so it goes now rather than at its expiry.
-                destroy_session(relay, ticket).await;
+                failures = 0;
                 session.set_phase(Phase::Live);
-                return pump(&webrtc, keyframe, session).await;
+
+                // The session deliberately stays on the relay while this runs.
+                // It used to be deleted the moment a viewer connected, on the
+                // grounds that nothing needed to be fetchable any more, and
+                // that is what made a code good for exactly one use: a viewer
+                // whose connection dropped could not come back without being
+                // handed a new one from the other machine.
+                let outcome = pump(&webrtc, keyframe, Arc::clone(&session)).await;
+
+                if session.should_stop() {
+                    return outcome;
+                }
+
+                // The viewer left and this end did not. Offer again under the
+                // same code so they can simply reload.
+                session.note(match &outcome {
+                    Ok(()) => "the viewer left. The same code still works.".to_owned(),
+                    Err(e) => format!("{e}. The same code still works."),
+                });
+                continue;
             }
             // A peer connection cannot take a second answer once it has one,
             // so recovering means a whole new connection and a new offer.
-            Err(_) => continue,
+            Err(_) => {
+                failures += 1;
+                continue;
+            }
         }
     }
 
@@ -404,13 +478,25 @@ async fn destroy_session(relay: &str, ticket: &Ticket) {
 /// already been claimed at that point, and someone the host just refused is
 /// exactly the person who should not get another go at it, starting again
 /// issues a fresh code.
-async fn approved(answer: &str, session: &Arc<Session>) -> bool {
+/// What the host said about a viewer, and the difference that matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    /// Let in, by a person or by the setting.
+    Allowed,
+    /// Actively turned away. A person decided this, so it stands.
+    Refused,
+    /// Nobody answered. That is not a decision, and must not be treated as
+    /// one: see `APPROVAL_TIMEOUT`.
+    Unanswered,
+}
+
+async fn approved(answer: &str, session: &Arc<Session>) -> Decision {
     // Asked for explicitly, so there is nobody to ask. The viewer is still
     // named in the read-out rather than let in silently: not having to answer
     // is the point, not being unable to see who arrived.
     if session.auto_approve() {
         session.note(format!("let {} in without asking", describe_viewer(answer)));
-        return true;
+        return Decision::Allowed;
     }
 
     session.request_approval(&describe_viewer(answer));
@@ -418,14 +504,14 @@ async fn approved(answer: &str, session: &Arc<Session>) -> bool {
     let deadline = Instant::now() + APPROVAL_TIMEOUT;
     while Instant::now() < deadline {
         if session.should_stop() {
-            return false;
+            return Decision::Refused;
         }
         if let Some(decision) = session.approval_decision() {
-            return decision;
+            return if decision { Decision::Allowed } else { Decision::Refused };
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    false
+    Decision::Unanswered
 }
 
 /// A short description of whoever is asking, taken from their SDP.

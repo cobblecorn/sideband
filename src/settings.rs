@@ -56,6 +56,14 @@ impl Settings {
             settings.relay = std::env::var("SIDEBAND_RELAY").unwrap_or_default();
         }
 
+        // An override that does not depend on a file having been written
+        // correctly, because the file is exactly what was in doubt: a window
+        // left open from an older build rewrites it in the older format on
+        // exit, quietly dropping settings that build had never heard of.
+        if std::env::var("SIDEBAND_AUTO_ADMIT").is_ok_and(|v| truthy(&v)) {
+            settings.auto_approve = true;
+        }
+
         // Trimmed here rather than at every use, so the value held in memory
         // is byte-for-byte the one that would be written back and the window
         // can tell "unchanged" from "edited" by comparing them.

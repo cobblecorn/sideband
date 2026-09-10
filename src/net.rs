@@ -76,6 +76,16 @@ impl KeyframeSignal {
 struct Handler {
     gathering_done: Arc<Notify>,
     connected: Arc<Notify>,
+    /// Set the moment the connection is up, and never cleared.
+    ///
+    /// The flag is what makes this reliable; the `Notify` beside it only
+    /// shortens the wait. `notify_waiters` wakes tasks that are *already*
+    /// waiting and stores nothing for one that has not arrived yet, so a
+    /// viewer who connects before the host reaches its wait is a notification
+    /// that goes nowhere and a host that waits for ever. It is a race, and it
+    /// is worse the faster the viewer is: a reconnect, where both ends already
+    /// know the route, loses it almost every time.
+    is_connected: Arc<AtomicBool>,
     keyframe: KeyframeSignal,
     /// Set once the connection reaches a state it cannot come back from.
     /// Without this the send loop keeps encoding into a socket nobody is
@@ -97,6 +107,9 @@ impl PeerConnectionEventHandler for Handler {
                 // A viewer joining mid-stream has no reference frame, so the
                 // very first thing they need is an IDR.
                 self.keyframe.request();
+                // Flag first, then wake. In this order a waiter that arrives
+                // between the two sees the flag rather than missing the wake.
+                self.is_connected.store(true, Ordering::Relaxed);
                 self.connected.notify_waiters();
             }
             // `Disconnected` is deliberately not here: it is what a couple of
@@ -120,6 +133,7 @@ pub struct Session<P: PeerConnection> {
     audio_ssrc: u32,
     gathering_done: Arc<Notify>,
     connected: Arc<Notify>,
+    is_connected: Arc<AtomicBool>,
     keyframe: KeyframeSignal,
     lost: Arc<AtomicBool>,
     feedback: ViewerFeedback,
@@ -278,6 +292,7 @@ pub async fn connect(
 
     let gathering_done = Arc::new(Notify::new());
     let connected = Arc::new(Notify::new());
+    let is_connected = Arc::new(AtomicBool::new(false));
     let keyframe = KeyframeSignal::default();
     let lost = Arc::new(AtomicBool::new(false));
 
@@ -288,6 +303,7 @@ pub async fn connect(
         .with_handler(Arc::new(Handler {
             gathering_done: Arc::clone(&gathering_done),
             connected: Arc::clone(&connected),
+            is_connected: Arc::clone(&is_connected),
             keyframe: keyframe.clone(),
             lost: Arc::clone(&lost),
         }))
@@ -347,6 +363,7 @@ pub async fn connect(
         audio_ssrc,
         gathering_done,
         connected,
+        is_connected,
         keyframe,
         lost,
         feedback,
@@ -403,8 +420,19 @@ impl<P: PeerConnection> Session<P> {
     }
 
     /// Resolves once the viewer's browser is actually connected.
+    ///
+    /// Checks the flag first and keeps checking, rather than trusting a single
+    /// notification to arrive after this is called. See `Handler::is_connected`
+    /// for the race that makes the flag the real answer here; the short waits
+    /// only keep this from being a busy loop.
     pub async fn wait_connected(&self) {
-        self.connected.notified().await;
+        while !self.is_connected.load(Ordering::Relaxed) {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                self.connected.notified(),
+            )
+            .await;
+        }
     }
 
     pub fn keyframe_signal(&self) -> KeyframeSignal {

@@ -94,6 +94,25 @@ export class SignallingSession {
       case "put-offer": {
         if (!(await this.authorised(request))) return json({ error: "denied" }, 403);
         await store.put("offer", await request.text());
+
+        // Publishing a fresh offer re-arms the session, and only the host can
+        // do it. A code was previously spent the moment anybody used it, which
+        // is the right rule for a code handed to somebody else and the wrong
+        // one for the commonest case there is: one person, two devices, trying
+        // to get a picture onto the other one. Every reconnect meant going
+        // back to the first machine for a new code.
+        //
+        // The code now lasts as long as the host is offering, and no longer.
+        // It stops working the moment the host stops, because the session is
+        // deleted then, and it cannot be re-armed by anyone but the holder of
+        // the token, which never leaves the host process.
+        await store.put("claimed", false);
+
+        // The clock restarts too. Without this a stream lasting longer than
+        // the expiry would have the relay delete the session out from under
+        // it, and the code would stop working mid-session for no visible
+        // reason.
+        await store.setAlarm(Date.now() + TTL_MS);
         return json({ ok: true });
       }
 
@@ -479,7 +498,11 @@ async function gather(pc, { minCandidates = 2, settle = 700, hardCap = 12000 } =
 async function attempt(code, onStatus) {
   onStatus('Looking up the stream…');
   const res = await fetch('/api/session/' + code + '/offer', { cache: 'no-store' });
-  if (res.status === 410) throw new Error('That code has already been used.');
+  // 410 means somebody is on this code right now, which is no longer the end
+  // of the story. The host keeps the code alive for as long as it is sharing
+  // and re-arms it whenever a viewer leaves, so this is usually a few seconds
+  // of the host building a fresh offer rather than a code that is finished.
+  if (res.status === 410) throw new Error('Someone is watching. Retrying…');
   if (res.status === 429) throw new Error('Too many attempts. Wait a moment.');
   if (res.status === 404) throw new Error('No stream with that code. It may have expired.');
   if (!res.ok) throw new Error('Could not reach the server.');
@@ -528,15 +551,28 @@ async function attempt(code, onStatus) {
 // One retry only, and only for failures that happen after the code was
 // accepted, a claimed or expired code will not become valid by asking again.
 async function connectWithRetry(code, onStatus, onFailure) {
-  for (let tryNo = 1; tryNo <= 2; tryNo++) {
+  // Two kinds of failure, and only one of them is worth waiting through.
+  //
+  // A code that never existed, or a rate limit, will not become valid by
+  // asking again. But "someone is watching" and a connection that did not
+  // take are both states the host climbs out of by itself within seconds:
+  // when a viewer leaves, the host publishes a new offer under the same code.
+  // Giving up on the first refusal is what made reconnecting mean walking
+  // back to the other machine for a fresh code.
+  const deadline = Date.now() + 40000;
+  let tryNo = 0;
+  for (;;) {
+    tryNo++;
     try {
       return await attempt(code, onStatus);
     } catch (e) {
       if (window.pc) { try { window.pc.close(); } catch (_) {} }
-      const fatal = /already been used|already watching|expired|Too many/.test(e.message);
-      if (fatal || tryNo === 2) throw e;
-      onStatus('That did not take - trying once more…');
-      await new Promise((r) => setTimeout(r, 1500));
+      const fatal = /expired|Too many|not valid/.test(e.message);
+      if (fatal || Date.now() > deadline) throw e;
+      onStatus(/watching/.test(e.message)
+        ? 'Someone is watching. Waiting for the stream to free up…'
+        : 'That did not take - trying again…');
+      await new Promise((r) => setTimeout(r, 2000));
     }
   }
 }
