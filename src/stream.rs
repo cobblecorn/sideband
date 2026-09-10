@@ -694,10 +694,10 @@ fn video_loop(
         pipeline::Pacer::new(FPS);
     let mut enc: Option<encoder::NvencEncoder> = None;
     let mut dims: (u32, u32) = (0, 0);
-    // How much the picture is being shrunk before encoding, and the scaler
-    // that does it. One means untouched, and the capture texture goes to the
-    // encoder exactly as it did before any of this existed.
-    let mut divisor: u32 = 1;
+    // Shrinks the picture when the controller says to. Nothing here decides
+    // how much: that is settled once per session in `bwe`, for the reason in
+    // its `divisor_for`. At full size this is never even constructed, so a
+    // fast link pays nothing for the existence of a slow one.
     let mut scaler: Option<scale::Scaler> = None;
     let mut last_idr = Instant::now();
 
@@ -774,18 +774,16 @@ fn video_loop(
         // whole of what a resolution change needs. Doing it here means a
         // resolution change and a window resize are the same event.
         //
-        // `divisor` is only ever assigned inside the arm that has a frame.
-        // The first cut of this reset it to one whenever a pass produced no
-        // frame, which is most passes, so every step started again from full
-        // size and the ladder could never get past its first rung: measured
-        // capped at 600 kbit/s, it settled at half size when it should have
-        // reached a quarter. State that survives between frames has to be
-        // left alone by the passes that have none.
+        // The size is decided by the controller, once a second, not here and
+        // not per frame. This loop runs at the frame rate and the target rate
+        // moves continuously, so deciding here meant re-deciding sixty times a
+        // second against a number that was never still: the picture visibly
+        // grew and shrank as the rate wandered across a threshold. The
+        // controller holds the decision until the link has actually moved.
+        let wanted = quality.get().divisor;
         let fresh = match fresh {
             Some((texture, w, h)) => {
-                let wanted = bwe::next_divisor(divisor, quality.get().bitrate);
                 if wanted <= 1 {
-                    divisor = 1;
                     Some((texture, w, h))
                 } else {
                     let scaler = scaler.get_or_insert_with(|| {
@@ -793,7 +791,6 @@ fn video_loop(
                     });
                     match scaler.shrink(&texture, w, h, wanted) {
                         Ok(smaller) => {
-                            divisor = wanted;
                             let (sw, sh) = scale::Scaler::target(w, h, wanted);
                             Some((smaller, sw, sh))
                         }
@@ -803,7 +800,6 @@ fn video_loop(
                             session.note(format!(
                                 "could not shrink the picture ({e}), sending full size"
                             ));
-                            divisor = 1;
                             Some((texture, w, h))
                         }
                     }

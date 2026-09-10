@@ -101,13 +101,24 @@ and 30 fps, low enough for almost any home link to carry from the first frame, a
 climbs to 1080p60 at 10 Mbit/s over the next ten to twenty seconds if the viewer
 keeps reporting a clean path. If they stop, it comes back down quickly.
 
-Three things move, not two. Bitrate, frame rate down a ladder of 60, 30 and 20,
-and the resolution itself: below about 3 Mbit/s the picture is encoded at half
-size and below 1 Mbit/s at a quarter, and the viewer's browser scales it back up
-to fill their window. That last one matters more than it sounds. A full sized
-1080p picture at half a megabit is about twelve thousandths of a bit per pixel,
-which does not freeze and does not stutter, it simply arrives as mush. Quartering
-each dimension buys sixteen times as many bits per pixel for the same bandwidth.
+Bitrate and frame rate move continuously. The **picture size does not**. It is
+chosen once, about ten seconds in, from whatever the connection turned out to
+support, and then held for the rest of the session.
+
+That asymmetry is deliberate. A bitrate change is invisible and a frame rate
+change nearly so, but a resolution change resizes the picture in the viewer's
+window, and chasing the connection with it means a window that grows and shrinks
+whenever the rate wanders across a threshold. A slightly soft picture is
+something you stop noticing after a minute. One that keeps resizing is not.
+
+The one decision is worth making, though: a full sized 1080p picture at half a
+megabit is about twelve thousandths of a bit per pixel, which never freezes and
+never stutters, it simply arrives as mush. Quartering each dimension buys sixteen
+times as many bits per pixel for the same bandwidth, and the viewer's browser
+scales it back up to fill their window.
+
+**To fix the size yourself** and have it never change at all, not even once, set
+`SIDEBAND_SCALE` to 1, 2 or 4, for full, half or quarter.
 
 **If you want to cap what it uses**, set `SIDEBAND_MAX_BITRATE` to a number of
 kbit/s. Everything above still applies underneath it; this only lowers the
@@ -325,10 +336,10 @@ cargo test
   purpose, sustained: every surviving frame decoded, no freezes, and no picture
   requests. The visible cost is a faint band sweeping the picture once after
   heavy loss.
-- **Resolution steps in powers of two only.** Full, half or quarter of the source
-  window, chosen from the settled bitrate. Anything in between would need a
-  scaler with a shader in it rather than mipmap generation, for a difference
-  nobody watching would notice.
+- **Resolution is powers of two, and settles once.** Full, half or quarter of the
+  source window, decided about ten seconds in and then fixed. Anything in between
+  would need a scaler with a shader in it rather than mipmap generation, for a
+  difference nobody watching would notice.
 - **Packaged ("Store") applications may have no capturable audio.** Their window
   belongs to `ApplicationFrameHost.exe` while the application runs in a separate
   process that is not below it, so audio scoped to the window's process tree

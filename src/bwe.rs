@@ -200,58 +200,42 @@ const FPS_LADDER: &[Rung] = &[
     Rung { fps: 20, drop_below: 0, climb_above: 2_000_000 },
 ];
 
-/// How far the picture is shrunk before encoding, and when.
+/// How far the picture is shrunk before encoding.
 ///
-/// The other half of fitting a stream to a link, and the half that was missing.
-/// Bitrate and frame rate were adjustable and resolution was not, so a viewer
-/// on a slow connection got a full sized picture squeezed into whatever bits
-/// were left: 1080p at half a megabit is about twelve thousandths of a bit per
-/// pixel, which does not freeze but does turn everything to mush.
+/// Bitrate and frame rate are fitted to the link continuously, and this is not.
+/// It is chosen once and then held for the rest of the session, which is a
+/// deliberate departure from how everything else here works.
 ///
-/// Halving each dimension quarters the pixel count, so the same bits buy four
-/// times as many per pixel. The picture is smaller and the viewer's browser
-/// scales it back up, which is a far better trade than sharp edges nobody can
-/// make out.
+/// The reason is that a viewer notices this in a way they notice nothing else.
+/// A bitrate change is invisible, a frame rate change is nearly so, and a
+/// resolution change resizes the picture in front of them. Chasing the link
+/// with it, which is what the first version of this did, produced a window
+/// that grew and shrank as the rate wandered across a threshold, and that is
+/// worse than simply being at the wrong size: a slightly soft picture is
+/// something you stop noticing after a minute, and one that keeps resizing is
+/// something you never stop noticing.
 ///
-/// Divisors are powers of two on purpose. The scaler downsamples by generating
-/// mipmaps, which is a GPU operation with no shader and no CPU readback, and
-/// mip levels are exactly the powers of two.
-const SCALE_LADDER: &[Scale] = &[
-    Scale { divisor: 1, drop_below: 3_000_000, climb_above: u32::MAX },
-    Scale { divisor: 2, drop_below: 1_000_000, climb_above: 4_200_000 },
-    Scale { divisor: 4, drop_below: 0, climb_above: 1_700_000 },
-];
-
-struct Scale {
-    divisor: u32,
-    /// Shrink further below this bitrate.
-    drop_below: u32,
-    /// Go back up a step at or beyond this bitrate.
-    climb_above: u32,
+/// Divisors are powers of two because the scaler downsamples by generating
+/// mipmaps, and mip levels are exactly the powers of two.
+fn divisor_for(bitrate: u32) -> u32 {
+    match bitrate {
+        b if b >= 3_000_000 => 1,
+        b if b >= 1_000_000 => 2,
+        _ => 4,
+    }
 }
 
-/// The divisor to encode at next, given the one in use and the rate settled on.
+/// Intervals spent measuring before the size is fixed.
 ///
-/// Hysteresis, for the reason the frame rate ladder has it: the gap between
-/// `drop_below` and the rung above's `climb_above` is what stops a link sitting
-/// near a boundary from rebuilding the encoder every second. A resolution
-/// change is more expensive than a frame rate change, because it means a new
-/// encoder session and new parameter sets, so the gaps here are wider.
-pub fn next_divisor(current: u32, bitrate: u32) -> u32 {
-    let at = SCALE_LADDER
-        .iter()
-        .position(|s| s.divisor == current)
-        .unwrap_or(0);
-    let step = &SCALE_LADDER[at];
-
-    if bitrate < step.drop_below && at + 1 < SCALE_LADDER.len() {
-        return SCALE_LADDER[at + 1].divisor;
-    }
-    if bitrate >= step.climb_above && at > 0 {
-        return SCALE_LADDER[at - 1].divisor;
-    }
-    step.divisor
-}
+/// The session opens at full size, because the alternative is guessing before
+/// any evidence exists, and a guess that starts small on a fast link is a
+/// picture that is needlessly soft for as long as it lasts. Ten seconds is
+/// long enough for the rate to have found roughly where it belongs and short
+/// enough that the one change happens while a viewer is still settling in.
+///
+/// After this, the size never moves again for the life of the session. One
+/// change, early, and then nothing.
+const SETTLE_INTERVALS: u32 = 10;
 
 struct Rung {
     fps: u32,
@@ -521,6 +505,9 @@ pub struct Feedback {
 pub struct Target {
     pub bitrate: u32,
     pub fps: u32,
+    /// How much to shrink each dimension before encoding. One is untouched.
+    /// Fixed for the session once settled, see `divisor_for`.
+    pub divisor: u32,
 }
 
 /// Rate control, biased towards coming down.
@@ -547,6 +534,14 @@ pub struct Controller {
     /// to take" is a question about the rest of the house, not about the link,
     /// and nothing measurable from here can answer it.
     ceiling: u32,
+    /// The picture size in force, and how many intervals have been seen.
+    /// Once `SETTLE_INTERVALS` have passed the size is decided and neither
+    /// field is ever read again.
+    divisor: u32,
+    intervals: u32,
+    /// A size chosen by hand, which is obeyed from the first frame and never
+    /// reconsidered. For anyone who would rather pick than be adapted to.
+    fixed: Option<u32>,
     /// Consecutive seconds the receiver's estimate has sat below what is
     /// actually being sent. The counterpart to `last_estimate`: one catches an
     /// estimate falling, this one catches an estimate that has already fallen
@@ -566,11 +561,18 @@ impl Controller {
             last_estimate: None,
             below: 0,
             ceiling: env_ceiling(),
+            divisor: env_scale().unwrap_or(1),
+            intervals: 0,
+            fixed: env_scale(),
         }
     }
 
     pub fn target(&self) -> Target {
-        Target { bitrate: self.bitrate, fps: FPS_LADDER[self.rung].fps.min(self.max_fps) }
+        Target {
+            bitrate: self.bitrate,
+            fps: FPS_LADDER[self.rung].fps.min(self.max_fps),
+            divisor: self.divisor,
+        }
     }
 
     /// Folds one interval's evidence in and returns the new target.
@@ -718,6 +720,17 @@ impl Controller {
         self.bitrate = self.bitrate.min(self.ceiling).max(MIN_BITRATE);
 
         self.rung = next_rung(self.rung, self.bitrate);
+
+        // Decided once, on the interval the settling window ends, and never
+        // revisited. Not a ladder and not hysteresis: those both mean it can
+        // move again later, and it must not.
+        if self.fixed.is_none() {
+            self.intervals += 1;
+            if self.intervals == SETTLE_INTERVALS {
+                self.divisor = divisor_for(self.bitrate);
+            }
+        }
+
         self.target()
     }
 
@@ -740,6 +753,20 @@ fn env_ceiling() -> u32 {
         .and_then(|v| v.trim().parse::<u32>().ok())
         .map(|kbit| kbit.saturating_mul(1000).clamp(MIN_BITRATE, MAX_BITRATE))
         .unwrap_or(MAX_BITRATE)
+}
+
+/// A hand-picked picture size, or nothing.
+///
+/// `SIDEBAND_SCALE` of 1, 2 or 4, meaning full, half or quarter. Set, it is
+/// obeyed from the first frame and the size never changes at all, not even
+/// once. Anything else is ignored rather than guessed at.
+fn env_scale() -> Option<u32> {
+    match std::env::var("SIDEBAND_SCALE").ok()?.trim() {
+        "1" => Some(1),
+        "2" => Some(2),
+        "4" => Some(4),
+        _ => None,
+    }
 }
 
 /// Scales without clamping to the stream's bitrate limits, for figures that
@@ -799,6 +826,7 @@ pub struct Quality(Arc<Shared>);
 struct Shared {
     bitrate: AtomicU32,
     fps: AtomicU32,
+    divisor: AtomicU32,
 }
 
 impl Quality {
@@ -806,18 +834,21 @@ impl Quality {
         Self(Arc::new(Shared {
             bitrate: AtomicU32::new(target.bitrate),
             fps: AtomicU32::new(target.fps),
+            divisor: AtomicU32::new(target.divisor),
         }))
     }
 
     pub fn set(&self, target: Target) {
         self.0.bitrate.store(target.bitrate, Ordering::Relaxed);
         self.0.fps.store(target.fps, Ordering::Relaxed);
+        self.0.divisor.store(target.divisor, Ordering::Relaxed);
     }
 
     pub fn get(&self) -> Target {
         Target {
             bitrate: self.0.bitrate.load(Ordering::Relaxed),
             fps: self.0.fps.load(Ordering::Relaxed),
+            divisor: self.0.divisor.load(Ordering::Relaxed),
         }
     }
 }
@@ -855,7 +886,7 @@ mod tests {
         // 2.5 Mbit/s cannot carry 60 fps well, so the stream opens at 30
         // rather than opening at 60 and dropping a second later.
         let c = Controller::new(START_BITRATE, 60);
-        assert_eq!(c.target(), Target { bitrate: START_BITRATE, fps: 30 });
+        assert_eq!(c.target(), Target { bitrate: START_BITRATE, fps: 30, divisor: 1 });
 
         // And a source capped at 30 is never asked for 60.
         assert_eq!(Controller::new(MAX_BITRATE, 30).target().fps, 30);
@@ -891,7 +922,10 @@ mod tests {
     #[test]
     fn a_clean_path_reaches_the_ceiling_and_stops() {
         let mut c = Controller::new(START_BITRATE, 60);
-        assert_eq!(keeping_up(&mut c, 60), Target { bitrate: MAX_BITRATE, fps: 60 });
+        assert_eq!(
+            keeping_up(&mut c, 60),
+            Target { bitrate: MAX_BITRATE, fps: 60, divisor: 1 }
+        );
     }
 
     #[test]
@@ -1244,50 +1278,57 @@ mod tests {
     }
 
     #[test]
-    fn resolution_shrinks_on_a_slow_link_and_comes_back() {
-        // The case this exists for: a viewer whose link settled at the floor
-        // was getting a full sized picture at half a megabit.
-        assert_eq!(next_divisor(1, 500_000), 2, "a slow link shrinks");
-        assert_eq!(next_divisor(2, 500_000), 4, "and keeps shrinking");
-        assert_eq!(next_divisor(4, 500_000), 4, "but only as far as the ladder goes");
+    fn the_picture_size_never_changes_once_it_is_settled() {
+        // The complaint this exists for. Bitrate and frame rate chase the link
+        // all session; the size gets one decision and then holds it, because a
+        // viewer sees this one and does not see the others.
+        let mut c = Controller::new(START_BITRATE, 60);
 
-        // And back, once there is room for it.
-        assert_eq!(next_divisor(4, 2_000_000), 2);
-        assert_eq!(next_divisor(2, 5_000_000), 1);
-        assert_eq!(next_divisor(1, 9_000_000), 1, "full size is the top");
-    }
+        // A link that settles slow.
+        for _ in 0..SETTLE_INTERVALS {
+            c.update(&losing(0.0, 600_000));
+            c.bitrate = 600_000;
+        }
+        let settled = c.target().divisor;
+        assert!(settled > 1, "a slow link should have shrunk, got {settled}");
 
-    #[test]
-    fn resolution_moves_one_step_at_a_time() {
-        // A single decision never jumps two rungs. Each step is a new encoder
-        // session and new parameter sets, and doing two at once would mean
-        // two of those back to back on a link already in trouble.
-        for bitrate in [0, 400_000, 900_000, 1_500_000, 3_000_000, 10_000_000] {
-            for current in [1, 2, 4] {
-                let next = next_divisor(current, bitrate);
-                let ratio = next.max(current) / next.min(current);
-                assert!(ratio <= 2, "{current} to {next} at {bitrate} is more than one step");
-            }
+        // Now swing the rate all over the place for a long time. Nothing about
+        // the size may move again.
+        for i in 0..300 {
+            c.bitrate = if i % 2 == 0 { 400_000 } else { 9_000_000 };
+            c.update(&losing(0.0, c.bitrate));
+            assert_eq!(
+                c.target().divisor,
+                settled,
+                "the size moved at interval {i}, it must not"
+            );
         }
     }
 
     #[test]
-    fn resolution_does_not_flap_at_a_boundary() {
-        // A link parked exactly where one step hands over to the next must
-        // settle rather than rebuild the encoder every second. The gap between
-        // dropping down and climbing back is what guarantees it.
-        let mut divisor = 1;
-        let mut changes = 0;
-        for _ in 0..50 {
-            // Just under the point at which full size gives up.
-            let next = next_divisor(divisor, 2_900_000);
-            if next != divisor {
-                changes += 1;
-                divisor = next;
-            }
+    fn a_session_opens_at_full_size() {
+        // Before there is evidence, guessing small would leave a fast link
+        // needlessly soft for as long as the guess lasted.
+        let c = Controller::new(START_BITRATE, 60);
+        assert_eq!(c.target().divisor, 1);
+    }
+
+    #[test]
+    fn a_fast_link_is_never_shrunk_at_all() {
+        let mut c = Controller::new(START_BITRATE, 60);
+        for _ in 0..(SETTLE_INTERVALS * 3) {
+            c.update(&losing(0.0, c.target().bitrate));
         }
-        assert_eq!(changes, 1, "should settle after one step, not oscillate");
-        assert_eq!(divisor, 2);
+        assert_eq!(c.target().divisor, 1, "nothing to fix on a good connection");
+    }
+
+    #[test]
+    fn the_size_thresholds_are_the_ones_that_matter() {
+        // Half a megabit at full size is about twelve thousandths of a bit per
+        // pixel, which is the mush this exists to prevent.
+        assert_eq!(divisor_for(500_000), 4);
+        assert_eq!(divisor_for(1_500_000), 2);
+        assert_eq!(divisor_for(5_000_000), 1);
     }
 
     #[test]
@@ -1379,9 +1420,9 @@ mod tests {
 
     #[test]
     fn quality_round_trips_across_the_thread_boundary() {
-        let q = Quality::new(Target { bitrate: START_BITRATE, fps: 60 });
+        let q = Quality::new(Target { bitrate: START_BITRATE, fps: 60, divisor: 1 });
         let reader = q.clone();
-        q.set(Target { bitrate: 1_000_000, fps: 30 });
-        assert_eq!(reader.get(), Target { bitrate: 1_000_000, fps: 30 });
+        q.set(Target { bitrate: 1_000_000, fps: 30, divisor: 2 });
+        assert_eq!(reader.get(), Target { bitrate: 1_000_000, fps: 30, divisor: 2 });
     }
 }
