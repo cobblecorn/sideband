@@ -146,6 +146,13 @@ impl WindowCapture {
         &self.device
     }
 
+    /// The immediate context, for the scaler. Shared rather than made afresh
+    /// because D3D11 immediate contexts are per device and not thread safe:
+    /// there is exactly one, and the encode thread is the only one using it.
+    pub fn context(&self) -> &ID3D11DeviceContext {
+        &self.context
+    }
+
     /// The next frame as a raw GPU texture plus its dimensions. This is the
     /// path the real pipeline uses, nothing is copied to the CPU.
     pub fn next_texture(&self) -> Result<Option<(ID3D11Texture2D, u32, u32)>> {

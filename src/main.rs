@@ -25,6 +25,7 @@ mod mic;
 mod net;
 mod pipeline;
 mod server;
+mod scale;
 mod session;
 mod settings;
 mod sources;

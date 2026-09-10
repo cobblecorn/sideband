@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 use crate::audio::OpusPacket;
 use crate::pipeline::VideoEncoder;
 use crate::session::{Phase, Session};
-use crate::{bwe, capture, encoder, hotkey, loopback, mic, net, pipeline, server, sources};
+use crate::{bwe, capture, encoder, hotkey, loopback, mic, net, pipeline, scale, server, sources};
 
 /// The fastest we ever capture or send. The rate controller may settle below
 /// this, see `bwe`, but never above it, because the source cannot produce
@@ -694,6 +694,11 @@ fn video_loop(
         pipeline::Pacer::new(FPS);
     let mut enc: Option<encoder::NvencEncoder> = None;
     let mut dims: (u32, u32) = (0, 0);
+    // How much the picture is being shrunk before encoding, and the scaler
+    // that does it. One means untouched, and the capture texture goes to the
+    // encoder exactly as it did before any of this existed.
+    let mut divisor: u32 = 1;
+    let mut scaler: Option<scale::Scaler> = None;
     let mut last_idr = Instant::now();
 
     // The target the encoder was last set to. Compared against rather than
@@ -759,6 +764,52 @@ fn video_loop(
                 cap = None;
                 continue;
             }
+        };
+
+        // Fit the picture to the link as well as the bitrate.
+        //
+        // Deliberately upstream of the geometry check below: shrinking changes
+        // the dimensions the encoder sees, and that check already knows how to
+        // rebuild for a new size and re-send parameter sets, which is the
+        // whole of what a resolution change needs. Doing it here means a
+        // resolution change and a window resize are the same event.
+        //
+        // `divisor` is only ever assigned inside the arm that has a frame.
+        // The first cut of this reset it to one whenever a pass produced no
+        // frame, which is most passes, so every step started again from full
+        // size and the ladder could never get past its first rung: measured
+        // capped at 600 kbit/s, it settled at half size when it should have
+        // reached a quarter. State that survives between frames has to be
+        // left alone by the passes that have none.
+        let fresh = match fresh {
+            Some((texture, w, h)) => {
+                let wanted = bwe::next_divisor(divisor, quality.get().bitrate);
+                if wanted <= 1 {
+                    divisor = 1;
+                    Some((texture, w, h))
+                } else {
+                    let scaler = scaler.get_or_insert_with(|| {
+                        scale::Scaler::new(source.device(), source.context())
+                    });
+                    match scaler.shrink(&texture, w, h, wanted) {
+                        Ok(smaller) => {
+                            divisor = wanted;
+                            let (sw, sh) = scale::Scaler::target(w, h, wanted);
+                            Some((smaller, sw, sh))
+                        }
+                        Err(e) => {
+                            // Full size is a worse picture than intended, and
+                            // a far better outcome than no picture.
+                            session.note(format!(
+                                "could not shrink the picture ({e}), sending full size"
+                            ));
+                            divisor = 1;
+                            Some((texture, w, h))
+                        }
+                    }
+                }
+            }
+            None => None,
         };
 
         // Rebuild on any geometry change. Dropping the old session first

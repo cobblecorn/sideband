@@ -101,6 +101,20 @@ and 30 fps, low enough for almost any home link to carry from the first frame, a
 climbs to 1080p60 at 10 Mbit/s over the next ten to twenty seconds if the viewer
 keeps reporting a clean path. If they stop, it comes back down quickly.
 
+Three things move, not two. Bitrate, frame rate down a ladder of 60, 30 and 20,
+and the resolution itself: below about 3 Mbit/s the picture is encoded at half
+size and below 1 Mbit/s at a quarter, and the viewer's browser scales it back up
+to fill their window. That last one matters more than it sounds. A full sized
+1080p picture at half a megabit is about twelve thousandths of a bit per pixel,
+which does not freeze and does not stutter, it simply arrives as mush. Quartering
+each dimension buys sixteen times as many bits per pixel for the same bandwidth.
+
+**If you want to cap what it uses**, set `SIDEBAND_MAX_BITRATE` to a number of
+kbit/s. Everything above still applies underneath it; this only lowers the
+ceiling. It is the one quality decision the software cannot make for you, because
+"how much of my upload may this take" is a question about the rest of your house
+rather than about the connection.
+
 **"They cannot hear it"** - watch the `app` level while the stream runs. Process
 loopback delivers evenly paced packets whether or not the application is making
 a sound, and it accepts any process at all without complaint, so a packet count
@@ -233,6 +247,7 @@ signalling server, and it is exactly what running your own answers.
 | Transport | WebRTC, pre-encoded H.264 + Opus |
 | Rate control | The viewer's REMB and receiver reports, read off the RTCP stream |
 | Recovery | NACK for what can be retransmitted, rolling intra refresh for the rest |
+| Scaling | Mipmap generation on the GPU, powers of two, no readback |
 | Pairing | Non-trickle SDP through a Worker, or served locally |
 
 Three invariants worth knowing before changing anything:
@@ -310,8 +325,10 @@ cargo test
   purpose, sustained: every surviving frame decoded, no freezes, and no picture
   requests. The visible cost is a faint band sweeping the picture once after
   heavy loss.
-- **Resolution never changes**, only bitrate and frame rate. A new resolution needs a
-  new SPS, and this stream deliberately sends parameter sets exactly once.
+- **Resolution steps in powers of two only.** Full, half or quarter of the source
+  window, chosen from the settled bitrate. Anything in between would need a
+  scaler with a shader in it rather than mipmap generation, for a difference
+  nobody watching would notice.
 - **Packaged ("Store") applications may have no capturable audio.** Their window
   belongs to `ApplicationFrameHost.exe` while the application runs in a separate
   process that is not below it, so audio scoped to the window's process tree

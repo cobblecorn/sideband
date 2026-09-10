@@ -200,6 +200,59 @@ const FPS_LADDER: &[Rung] = &[
     Rung { fps: 20, drop_below: 0, climb_above: 2_000_000 },
 ];
 
+/// How far the picture is shrunk before encoding, and when.
+///
+/// The other half of fitting a stream to a link, and the half that was missing.
+/// Bitrate and frame rate were adjustable and resolution was not, so a viewer
+/// on a slow connection got a full sized picture squeezed into whatever bits
+/// were left: 1080p at half a megabit is about twelve thousandths of a bit per
+/// pixel, which does not freeze but does turn everything to mush.
+///
+/// Halving each dimension quarters the pixel count, so the same bits buy four
+/// times as many per pixel. The picture is smaller and the viewer's browser
+/// scales it back up, which is a far better trade than sharp edges nobody can
+/// make out.
+///
+/// Divisors are powers of two on purpose. The scaler downsamples by generating
+/// mipmaps, which is a GPU operation with no shader and no CPU readback, and
+/// mip levels are exactly the powers of two.
+const SCALE_LADDER: &[Scale] = &[
+    Scale { divisor: 1, drop_below: 3_000_000, climb_above: u32::MAX },
+    Scale { divisor: 2, drop_below: 1_000_000, climb_above: 4_200_000 },
+    Scale { divisor: 4, drop_below: 0, climb_above: 1_700_000 },
+];
+
+struct Scale {
+    divisor: u32,
+    /// Shrink further below this bitrate.
+    drop_below: u32,
+    /// Go back up a step at or beyond this bitrate.
+    climb_above: u32,
+}
+
+/// The divisor to encode at next, given the one in use and the rate settled on.
+///
+/// Hysteresis, for the reason the frame rate ladder has it: the gap between
+/// `drop_below` and the rung above's `climb_above` is what stops a link sitting
+/// near a boundary from rebuilding the encoder every second. A resolution
+/// change is more expensive than a frame rate change, because it means a new
+/// encoder session and new parameter sets, so the gaps here are wider.
+pub fn next_divisor(current: u32, bitrate: u32) -> u32 {
+    let at = SCALE_LADDER
+        .iter()
+        .position(|s| s.divisor == current)
+        .unwrap_or(0);
+    let step = &SCALE_LADDER[at];
+
+    if bitrate < step.drop_below && at + 1 < SCALE_LADDER.len() {
+        return SCALE_LADDER[at + 1].divisor;
+    }
+    if bitrate >= step.climb_above && at > 0 {
+        return SCALE_LADDER[at - 1].divisor;
+    }
+    step.divisor
+}
+
 struct Rung {
     fps: u32,
     /// Step down to the next rung below this bitrate.
@@ -486,6 +539,14 @@ pub struct Controller {
     /// The previous receiver estimate, because the direction it moved is what
     /// carries the meaning, see `update`.
     last_estimate: Option<u32>,
+    /// The most this session may ever ask for.
+    ///
+    /// `MAX_BITRATE` unless `SIDEBAND_MAX_BITRATE` says otherwise, in kbit/s.
+    /// A deliberate lever rather than a tuning knob: the controller finds the
+    /// link's capacity on its own, but "how much of my upload is this allowed
+    /// to take" is a question about the rest of the house, not about the link,
+    /// and nothing measurable from here can answer it.
+    ceiling: u32,
     /// Consecutive seconds the receiver's estimate has sat below what is
     /// actually being sent. The counterpart to `last_estimate`: one catches an
     /// estimate falling, this one catches an estimate that has already fallen
@@ -504,6 +565,7 @@ impl Controller {
             proven: 0,
             last_estimate: None,
             below: 0,
+            ceiling: env_ceiling(),
         }
     }
 
@@ -652,6 +714,9 @@ impl Controller {
             self.bitrate = self.bitrate.min(ceiling);
         }
 
+        // Applied last, so it caps whatever every rule above arrived at.
+        self.bitrate = self.bitrate.min(self.ceiling).max(MIN_BITRATE);
+
         self.rung = next_rung(self.rung, self.bitrate);
         self.target()
     }
@@ -663,6 +728,18 @@ impl Controller {
         let extra = self.calm.saturating_sub(CALM_BEFORE_RAMP) as f64;
         (RAMP + extra * RAMP_ACCELERATION).min(RAMP_MAX)
     }
+}
+
+/// A hand-set ceiling, in kbit/s, or the built in one.
+///
+/// Read once per session rather than per interval: a value that changed under
+/// a running stream would be a rate control input nobody could reproduce.
+fn env_ceiling() -> u32 {
+    std::env::var("SIDEBAND_MAX_BITRATE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map(|kbit| kbit.saturating_mul(1000).clamp(MIN_BITRATE, MAX_BITRATE))
+        .unwrap_or(MAX_BITRATE)
 }
 
 /// Scales without clamping to the stream's bitrate limits, for figures that
@@ -1150,6 +1227,67 @@ mod tests {
         assert_eq!(next_fps(30, 1_000_000), 20);
         assert_eq!(next_fps(20, 1_500_000), 20);
         assert_eq!(next_fps(20, 2_000_000), 30);
+    }
+
+    #[test]
+    fn a_hand_set_ceiling_caps_everything_above_it() {
+        // The lever, and the thing that must not happen: a ceiling low enough
+        // to be useful must still leave a working stream, not clamp its way
+        // to zero.
+        let mut c = Controller::new(START_BITRATE, 60);
+        c.ceiling = 900_000;
+        for _ in 0..30 {
+            c.update(&losing(0.0, c.target().bitrate));
+        }
+        assert!(c.target().bitrate <= 900_000, "got {}", c.target().bitrate);
+        assert!(c.target().bitrate >= MIN_BITRATE, "got {}", c.target().bitrate);
+    }
+
+    #[test]
+    fn resolution_shrinks_on_a_slow_link_and_comes_back() {
+        // The case this exists for: a viewer whose link settled at the floor
+        // was getting a full sized picture at half a megabit.
+        assert_eq!(next_divisor(1, 500_000), 2, "a slow link shrinks");
+        assert_eq!(next_divisor(2, 500_000), 4, "and keeps shrinking");
+        assert_eq!(next_divisor(4, 500_000), 4, "but only as far as the ladder goes");
+
+        // And back, once there is room for it.
+        assert_eq!(next_divisor(4, 2_000_000), 2);
+        assert_eq!(next_divisor(2, 5_000_000), 1);
+        assert_eq!(next_divisor(1, 9_000_000), 1, "full size is the top");
+    }
+
+    #[test]
+    fn resolution_moves_one_step_at_a_time() {
+        // A single decision never jumps two rungs. Each step is a new encoder
+        // session and new parameter sets, and doing two at once would mean
+        // two of those back to back on a link already in trouble.
+        for bitrate in [0, 400_000, 900_000, 1_500_000, 3_000_000, 10_000_000] {
+            for current in [1, 2, 4] {
+                let next = next_divisor(current, bitrate);
+                let ratio = next.max(current) / next.min(current);
+                assert!(ratio <= 2, "{current} to {next} at {bitrate} is more than one step");
+            }
+        }
+    }
+
+    #[test]
+    fn resolution_does_not_flap_at_a_boundary() {
+        // A link parked exactly where one step hands over to the next must
+        // settle rather than rebuild the encoder every second. The gap between
+        // dropping down and climbing back is what guarantees it.
+        let mut divisor = 1;
+        let mut changes = 0;
+        for _ in 0..50 {
+            // Just under the point at which full size gives up.
+            let next = next_divisor(divisor, 2_900_000);
+            if next != divisor {
+                changes += 1;
+                divisor = next;
+            }
+        }
+        assert_eq!(changes, 1, "should settle after one step, not oscillate");
+        assert_eq!(divisor, 2);
     }
 
     #[test]
