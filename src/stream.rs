@@ -268,126 +268,159 @@ async fn serve_relay(pid: u32, relay: String, session: Arc<Session>) -> Result<(
     outcome
 }
 
+/// Admits one viewer: a fresh offer, published under the same code, and the
+/// answer to it.
+///
+/// One connection per viewer is not a choice, it is how WebRTC works: a peer
+/// connection takes exactly one answer. Publishing a new offer also re-arms
+/// the code, so the next person to open the link finds it working.
+async fn admit_one(
+    relay: &str,
+    ticket: &Ticket,
+    link: &str,
+    session: &Arc<Session>,
+    watching: usize,
+//
+// `use<>` captures nothing: without it the returned connection borrows every
+// argument for its whole life, which makes it unable to leave the task that
+// built it, and admitting viewers happens on a task of its own.
+) -> Result<net::Session<impl webrtc::peer_connection::PeerConnection + use<>>, String> {
+    let webrtc = net::connect(net::ice_servers()).await?;
+
+    session.preparing("gathering network candidates");
+    let offer = webrtc.offer().await?;
+
+    session.preparing("publishing to the relay");
+    put_offer(relay, ticket, offer).await?;
+
+    // The read-out only goes back to "waiting" when nobody is watching yet.
+    // With somebody already connected the session is live and stays live; a
+    // second person arriving must not make the window look like it dropped
+    // the first.
+    if watching == 0 {
+        session.set_phase(Phase::Waiting {
+            code: Some(ticket.code.clone()),
+            link: link.to_owned(),
+        });
+    }
+
+    let answer = poll_answer(relay, ticket, session).await?;
+
+    match approved(&answer, session).await {
+        Decision::Allowed => {}
+        Decision::Refused => {
+            webrtc.close().await;
+            return Err("you turned that viewer away".into());
+        }
+        Decision::Unanswered => {
+            webrtc.close().await;
+            session.note(
+                "nobody answered the prompt here, so that viewer was not let in. \
+                 The same code still works: turn on auto admit if you are the one \
+                 at the other end."
+                    .to_owned(),
+            );
+            return Err("nobody answered".into());
+        }
+    }
+
+    if watching == 0 {
+        session.preparing("connecting");
+    }
+    webrtc.accept_answer(&answer).await?;
+
+    match tokio::time::timeout(CONNECT_TIMEOUT, webrtc.wait_connected()).await {
+        Ok(()) => Ok(webrtc),
+        Err(_) => {
+            webrtc.close().await;
+            Err("that viewer answered but never connected".into())
+        }
+    }
+}
+
+/// Shares to everyone who opens the link, for as long as this is running.
+///
+/// Admitting somebody and admitting somebody *else* are the same operation, so
+/// the code keeps working rather than being spent on whoever got there first.
 async fn relay_attempts(
     relay: &str,
     ticket: &Ticket,
     link: &str,
     session: Arc<Session>,
 ) -> Result<(), String> {
-    // Not a fixed number of attempts any more. The code lives as long as this
-    // loop does, and this loop lives until the host stops or too many attempts
-    // fail back to back.
+    let mut watching: tokio::task::JoinSet<Result<(), String>> = tokio::task::JoinSet::new();
     let mut failures = 0usize;
-    let mut first = true;
 
-    while failures < MAX_ATTEMPTS {
+    loop {
         if session.should_stop() {
-            return Ok(());
-        }
-        if !first {
-            session.preparing("offering again - the same code still works");
-        }
-        first = false;
-
-        let webrtc = net::connect(net::ice_servers()).await?;
-        let keyframe = webrtc.keyframe_signal();
-
-        session.preparing("gathering network candidates");
-        let offer = webrtc.offer().await?;
-
-        session.preparing("publishing to the relay");
-        put_offer(relay, ticket, offer).await?;
-
-        session.set_phase(Phase::Waiting {
-            code: Some(ticket.code.clone()),
-            link: link.to_owned(),
-        });
-
-        let answer = match poll_answer(relay, ticket, &session).await {
-            Ok(answer) => answer,
-            Err(e) if e == "cancelled" => {
-                webrtc.close().await;
-                return Ok(());
-            }
-            // Nobody came before the relay's clock ran out. Publishing again
-            // restarts that clock, so the code on screen keeps working rather
-            // than quietly becoming a dead string of letters.
-            Err(_) => {
-                webrtc.close().await;
-                continue;
-            }
-        };
-
-        // Knowing the code is not enough. Someone has to say yes, or have said
-        // in advance that they would.
-        match approved(&answer, &session).await {
-            Decision::Allowed => {}
-            Decision::Refused => {
-                webrtc.close().await;
-                return Err("you turned that viewer away".into());
-            }
-            Decision::Unanswered => {
-                webrtc.close().await;
-                session.note(
-                    "nobody answered the prompt here, so that viewer was not let in.                      The same code still works: turn on auto admit if you are the one                      at the other end."
-                        .to_owned(),
-                );
-                continue;
-            }
+            break;
         }
 
-        session.preparing("connecting");
-        webrtc.accept_answer(&answer).await?;
+        // Read before the select, because the arms below borrow the set.
+        let already_watching = watching.len();
 
-        match tokio::time::timeout(CONNECT_TIMEOUT, webrtc.wait_connected()).await {
-            Ok(()) => {
-                failures = 0;
-                session.set_phase(Phase::Live);
-
-                // The session stays on the relay while this runs, so the code
-                // keeps working. It used to be deleted the moment a viewer
-                // connected, which is what made a code good for exactly one
-                // use: a viewer whose connection dropped could not come back
-                // without being handed a new one from the other machine.
-                failures = 0;
-                session.set_phase(Phase::Live);
-
-                // The session stays on the relay while this runs, so the code
-                // keeps working and the viewer can come back to it.
-                //
-                // This did not work until the interface binding was fixed. A
-                // second connection gathered perfectly good candidates and
-                // then never completed, because ICE was sending its checks out
-                // of an adapter with no route to anywhere. See net::local_bind.
-                let outcome = pump(&webrtc, keyframe, Arc::clone(&session)).await;
-
-                // Handed back before the next one is built, so there is never
-                // more than one live ICE agent here.
-                webrtc.close().await;
-                if session.should_stop() {
-                    return outcome;
+        tokio::select! {
+            // Somebody left. With nobody watching this goes back to offering
+            // and waiting; with others still connected it changes nothing.
+            Some(finished) = watching.join_next(), if !watching.is_empty() => {
+                if let Ok(Err(e)) = finished {
+                    session.note(format!("{e}. The same code still works."));
                 }
-
-                session.note(match &outcome {
-                    Ok(()) => "the viewer left. The same code still works.".to_owned(),
-                    Err(e) => format!("{e}. The same code still works."),
-                });
-                continue;
+                if watching.is_empty() && !session.should_stop() {
+                    session.set_phase(Phase::Waiting {
+                        code: Some(ticket.code.clone()),
+                        link: link.to_owned(),
+                    });
+                }
             }
-            // A peer connection cannot take a second answer once it has one,
-            // so recovering means a whole new connection and a new offer.
-            Err(_) => {
-                webrtc.close().await;
-                failures += 1;
-                continue;
+
+            admitted = admit_one(relay, ticket, link, &session, already_watching) => {
+                match admitted {
+                    Ok(viewer) => {
+                        failures = 0;
+                        if already_watching > 0 {
+                            session.note("somebody else is watching too.".to_owned());
+                        }
+                        session.set_phase(Phase::Live);
+
+                        let session = Arc::clone(&session);
+                        watching.spawn(async move {
+                            let keyframe = viewer.keyframe_signal();
+                            let result = pump(&viewer, keyframe, session).await;
+                            viewer.close().await;
+                            result
+                        });
+                    }
+                    Err(e) if e == "you turned that viewer away" => {
+                        if watching.is_empty() {
+                            return Err(e);
+                        }
+                    }
+                    Err(_) => {
+                        // A failed admission leaves the code alive, so this
+                        // goes round again and offers afresh. The count only
+                        // gives up when nobody is watching at all.
+                        if watching.is_empty() {
+                            failures += 1;
+                            if failures >= MAX_ATTEMPTS {
+                                return Err(
+                                    "the viewer could not connect after several attempts".into(),
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
-    Err("the viewer could not connect after several attempts".into())
+    watching.abort_all();
+    session.set_phase(Phase::Ended);
+    Ok(())
 }
 
 /// What the relay hands back when a session is created.
+#[derive(Clone)]
 struct Ticket {
     code: String,
     /// Proves we are the host. Never shown, never spoken, never in a URL,
@@ -638,62 +671,178 @@ impl Sabotage {
 }
 
 /// Capture, encode and send until the connection ends or a stop is requested.
+/// The capture, encode and audio pipeline, and the threads running it.
+///
+/// Pulled out of `pump` because there are two callers now: one viewer served
+/// locally, and any number of them through a relay. Only one of these exists
+/// per session however many people are watching, which is the whole point of
+/// the exercise: the picture is captured once, encoded once, and the same
+/// bytes go to everybody.
+struct Media {
+    stop: Arc<AtomicBool>,
+    quality: bwe::Quality,
+    controller: bwe::Controller,
+    video_rx: mpsc::Receiver<(Vec<u8>, u64)>,
+    audio_rx: mpsc::Receiver<OpusPacket>,
+    video_thread: std::thread::JoinHandle<Result<(), String>>,
+    audio_thread: std::thread::JoinHandle<Result<(), String>>,
+    microphone: Arc<mic::Mic>,
+    resume_keyframe: net::KeyframeSignal,
+}
+
+impl Media {
+    fn start(keyframe: net::KeyframeSignal, session: &Arc<Session>) -> Self {
+        // One clone stays here to force a refresh on resume; the other is
+        // moved into the encode thread, which services the request.
+        let resume_keyframe = keyframe.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Nothing is known about the viewer's connection yet, so the stream
+        // opens at a rate almost any home link can carry and earns its way up
+        // from there. Sending the ceiling first and waiting to be told to stop
+        // is how the picture freezes within seconds of connecting.
+        let controller = bwe::Controller::new(bwe::START_BITRATE, FPS);
+        let quality = bwe::Quality::new(controller.target());
+
+        // Whichever device was chosen in the window, or the default if that
+        // one has since been unplugged.
+        let chosen_mic = crate::settings::Settings::load().mic_device;
+        let microphone = Arc::new(mic::Mic::start_on(
+            Some(chosen_mic).filter(|id| !id.is_empty()),
+            Arc::clone(&stop),
+        ));
+        if let Some(device) = microphone.opened() {
+            session.set_mic_name(device.name.clone());
+        }
+        session.set_mic_available(microphone.available());
+        if microphone.available() {
+            let ui = Arc::clone(session);
+            hotkey::spawn_toggle(microphone.handle(), move |on| ui.set_mic_on(on));
+        }
+
+        // Small queues on purpose: they exist to smooth jitter, not to buffer.
+        let (video_tx, video_rx) = mpsc::channel::<(Vec<u8>, u64)>(4);
+        let (audio_tx, audio_rx) = mpsc::channel::<OpusPacket>(32);
+
+
+        let video_thread = {
+            let stop = Arc::clone(&stop);
+            let session = Arc::clone(session);
+            let quality = quality.clone();
+            std::thread::spawn(move || video_loop(keyframe, stop, video_tx, session, quality))
+        };
+        let audio_thread = {
+            let stop = Arc::clone(&stop);
+            let session = Arc::clone(session);
+            let microphone = Arc::clone(&microphone);
+            std::thread::spawn(move || {
+                loopback::stream_opus(session, stop, audio_tx, Some(microphone))
+            })
+        };
+
+        Self {
+            stop,
+            quality,
+            controller,
+            video_rx,
+            audio_rx,
+            video_thread,
+            audio_thread,
+            microphone,
+            resume_keyframe,
+        }
+    }
+
+    /// Stops the threads and reports anything they died of.
+    ///
+    /// The receiving ends are dropped first, and that ordering is the whole
+    /// point: a thread parked in `blocking_send` on a full queue never reaches
+    /// the top of its loop to see the stop flag, so joining without this waits
+    /// for a thread that is waiting for us.
+    fn finish(self, session: &Session) {
+        self.stop.store(true, Ordering::Relaxed);
+        drop(self.video_rx);
+        drop(self.audio_rx);
+
+        if let Ok(Err(e)) = self.video_thread.join() {
+            session.note(format!("video stopped: {e}"));
+        }
+        if let Ok(Err(e)) = self.audio_thread.join() {
+            session.note(format!("audio stopped: {e}"));
+        }
+    }
+}
+
+/// One viewer, served until it goes away.
+///
+/// A pipeline each, and that is not the obvious design. Capturing and encoding
+/// once and sending the same bytes to everybody is cheaper and is what was
+/// tried first, and it cannot work here: a viewer arriving late has no
+/// reference frame, the only thing that gives them one is an IDR, and a forced
+/// IDR does not survive this pipeline. Measured with two watching, the moment
+/// one was sent for the newcomer's benefit, *both* viewers went to zero frames
+/// a second and stayed there asking for pictures.
+///
+/// A fresh encoder session opens with an IDR and its own parameter sets, which
+/// is the one case known to work, because it is what every first viewer has
+/// always got. So everybody is a first viewer.
+///
+/// The cost is real: an encoder session and an encode pass per viewer. It buys
+/// a second person who can actually see something, and a rate that follows
+/// their connection rather than the worst one in the room.
 async fn pump<P: webrtc::peer_connection::PeerConnection>(
     webrtc: &net::Session<P>,
     keyframe: net::KeyframeSignal,
     session: Arc<Session>,
 ) -> Result<(), String> {
-    // One clone stays here to force an IDR on resume; the other is moved
-    // into the encode thread, which services the request.
-    let resume_keyframe = keyframe.clone();
-    let stop = Arc::new(AtomicBool::new(false));
+    let mut media = Media::start(keyframe, &session);
+    let mut viewer = Viewer::new(webrtc);
 
-    // Nothing is known about the viewer's connection yet, so the stream opens
-    // at a rate almost any home link can carry and earns its way up from
-    // there. Sending the ceiling first and waiting to be told to stop is how
-    // the picture freezes within seconds of connecting.
-    let mut controller = bwe::Controller::new(bwe::START_BITRATE, FPS);
-    let quality = bwe::Quality::new(controller.target());
-
-    // Whichever device was chosen in the window, or the default if that one
-    // has since been unplugged. Read here rather than passed in, so the
-    // command line honours the same choice.
-    let chosen_mic = crate::settings::Settings::load().mic_device;
-    let microphone = Arc::new(mic::Mic::start_on(
-        Some(chosen_mic).filter(|id| !id.is_empty()),
-        Arc::clone(&stop),
-    ));
-    if let Some(device) = microphone.opened() {
-        session.set_mic_name(device.name.clone());
-    }
-    session.set_mic_available(microphone.available());
-    if microphone.available() {
-        let ui = Arc::clone(&session);
-        hotkey::spawn_toggle(microphone.handle(), move |on| ui.set_mic_on(on));
-    }
-
-    // Small queues on purpose: they exist to smooth jitter, not to buffer.
-    let (video_tx, mut video_rx) = mpsc::channel::<(Vec<u8>, u64)>(4);
-    let (audio_tx, mut audio_rx) = mpsc::channel::<OpusPacket>(32);
-
-    let video_thread = {
-        let stop = Arc::clone(&stop);
-        let session = Arc::clone(&session);
-        let quality = quality.clone();
-        std::thread::spawn(move || video_loop(keyframe, stop, video_tx, session, quality))
-    };
-    let audio_thread = {
-        let stop = Arc::clone(&stop);
-        let session = Arc::clone(&session);
-        let microphone = Arc::clone(&microphone);
-        std::thread::spawn(move || {
-            loopback::stream_opus(session, stop, audio_tx, Some(microphone))
-        })
+    // Nothing ever arrives on this: the local path serves the one viewer it
+    // was given. Holding the sender keeps the channel open so the receiver
+    // simply never fires, rather than closing and ending the loop.
+    let (_never, mut nobody) = mpsc::channel::<()>(1);
+    let result = match run_media(
+        &mut media,
+        std::slice::from_mut(&mut viewer),
+        &session,
+        &mut nobody,
+    )
+    .await
+    {
+        Served::Ended(result) => result,
+        Served::Joined(()) => Ok(()),
     };
 
-    // Audio keeps its own fixed rate whatever the video does. It is a small
-    // fraction of the traffic, and a voice that stays intelligible while the
-    // picture softens is the right way round.
+    media.finish(&session);
+    if result.is_ok() {
+        session.set_phase(Phase::Ended);
+    }
+    result
+}
+
+/// One person watching.
+struct Viewer<'a, P: webrtc::peer_connection::PeerConnection> {
+    net: &'a net::Session<P>,
+}
+
+impl<'a, P: webrtc::peer_connection::PeerConnection> Viewer<'a, P> {
+    fn new(net: &'a net::Session<P>) -> Self {
+        Self { net }
+    }
+}
+
+/// Sends what the pipeline produces to everyone watching, until nobody is.
+///
+/// The viewers are a slice rather than one connection because the picture is
+/// captured once, encoded once, and the same bytes go to all of them. Adding a
+/// second person watching costs the upload and nothing else.
+async fn run_media<P: webrtc::peer_connection::PeerConnection, N>(
+    media: &mut Media,
+    viewers: &mut [Viewer<'_, P>],
+    session: &Arc<Session>,
+    joining: &mut mpsc::Receiver<N>,
+) -> Served<N> {
     let packet_duration = Duration::from_millis(20);
     let mut sabotage = Sabotage::from_env();
     let started = Instant::now();
@@ -702,9 +851,9 @@ async fn pump<P: webrtc::peer_connection::PeerConnection>(
     let mut control = tokio::time::interval(CONTROL_INTERVAL);
     let mut was_paused = false;
 
-    let result = loop {
+    loop {
         tokio::select! {
-            Some((au, ts)) = video_rx.recv() => {
+            Some((au, ts)) = media.video_rx.recv() => {
                 // While paused the channels are still drained, so capture does
                 // not block behind a full queue, the frames are simply not
                 // sent, and the viewer holds the last picture it decoded.
@@ -712,39 +861,57 @@ async fn pump<P: webrtc::peer_connection::PeerConnection>(
                     let len = au.len();
                     // The frame duration follows whatever cadence the rate
                     // controller settled on, because it is what the RTP
-                    // timestamps are derived from, leaving it at the original
-                    // 60ths of a second while sending 30 would tell the viewer
-                    // to play everything at double speed.
+                    // timestamps are derived from: leaving it at 60ths of a
+                    // second while sending 30 tells the viewer to play
+                    // everything at double speed.
                     let frame_duration =
-                        Duration::from_micros(1_000_000 / quality.get().fps.max(1) as u64);
-                    if let Err(e) = webrtc.send_video(&au, ts, frame_duration).await {
-                        break Err(e);
+                        Duration::from_micros(1_000_000 / media.quality.get().fps.max(1) as u64);
+
+                    for viewer in viewers.iter() {
+                        // A send failing is that viewer's problem rather than
+                        // everyone's, so the rest carry on.
+                        let _ = viewer.net.send_video(&au, ts, frame_duration).await;
                     }
                     session.note_video(len);
                 }
             }
-            Some(packet) = audio_rx.recv() => {
+            Some(packet) = media.audio_rx.recv() => {
                 if !session.paused() {
-                    if let Err(e) = webrtc
-                        .send_audio(&packet.data, packet.timestamp_us, packet_duration)
-                        .await
-                    {
-                        break Err(e);
+                    for viewer in viewers.iter() {
+                        let _ = viewer
+                            .net
+                            .send_audio(&packet.data, packet.timestamp_us, packet_duration)
+                            .await;
                     }
                     session.note_audio();
                 }
             }
             _ = control.tick() => {
-                // Everything the viewer has said about the last second, turned
-                // into one decision about the next one.
-                let feedback = webrtc.viewer_feedback();
-                let target = controller.update(&feedback);
-                quality.set(target);
+                // Everyone's feedback, reduced to the worst of it.
+                //
+                // The stream is one stream, so it has to suit the viewer
+                // having the hardest time. Taking the best, or the first, would
+                // mean the others are sent more than their connection can
+                // carry, and the whole reason this rate control exists is that
+                // doing so does not degrade, it freezes.
+                let feedback = viewers
+                    .iter()
+                    .map(|v| v.net.viewer_feedback())
+                    .reduce(bwe::Feedback::worst_of)
+                    .unwrap_or_default();
+                let target = media.controller.update(&feedback);
+                media.quality.set(target);
                 trace_rate(&feedback, target);
+            }
+            // Somebody else has joined. The borrow of the viewer list has to
+            // end before it can be added to, so this hands back and is called
+            // again with the newcomer included.
+            Some(arrival) = joining.recv() => {
+                break Served::Joined(arrival);
             }
             _ = ticker.tick() => {
                 if session.should_stop() {
-                    break Ok(());
+                    break Served::Ended(Ok(()));
                 }
 
                 // A picture that never starts is not the same as one that
@@ -762,69 +929,38 @@ async fn pump<P: webrtc::peer_connection::PeerConnection>(
                     );
                 }
 
-                // A connection that has failed or closed will never carry
-                // another frame, and without this the loop would keep
-                // encoding into it while the window still said "live".
-                if webrtc.lost() {
-                    break Err("the viewer's connection dropped".to_owned());
+                // Everyone has gone. A connection that has failed or closed
+                // will never carry another frame, and without this the loop
+                // would keep encoding into it while the window said "live".
+                if !viewers.is_empty() && viewers.iter().all(|v| v.net.lost()) {
+                    break Served::Ended(Err("the viewer's connection dropped".to_owned()));
                 }
 
-                // Resuming needs a fresh IDR: every frame dropped while paused
-                // was a reference some later frame depends on, so without one
-                // the viewer decodes garbage until the next keyframe.
+                // Resuming needs a fresh refresh: every frame dropped while
+                // paused was a reference some later frame depends on.
                 let paused = session.paused();
                 if was_paused && !paused {
-                    resume_keyframe.request();
+                    media.resume_keyframe.request();
                 }
                 was_paused = paused;
 
-                session.set_mic_peak(if microphone.is_on() {
-                    microphone.take_peak()
+                session.set_mic_peak(if media.microphone.is_on() {
+                    media.microphone.take_peak()
                 } else {
                     0.0
                 });
             }
-            else => break Ok(()),
+            else => break Served::Ended(Ok(())),
         }
-    };
-
-    stop.store(true, Ordering::Relaxed);
-
-    // Dropped before the joins below, and that ordering is the whole point.
-    //
-    // Both threads check `stop` at the top of their loop, but a thread parked
-    // inside `blocking_send` on a full queue never reaches the top of its loop
-    // again. The queues are small and this loop has just stopped draining
-    // them, so that is the *likely* state at this moment, not an unlucky one.
-    // Closing the receiving ends turns the block into the send error both
-    // threads already treat as "shutting down".
-    //
-    // Without it, `join` waits for a thread that is waiting for us, and the
-    // process survives its own window: no UI, no stream, still running, still
-    // holding the capture and the encoder session. Every leftover `sideband`
-    // in Task Manager came from here.
-    drop(video_rx);
-    drop(audio_rx);
-
-    // Both results are read, not discarded.
-    //
-    // A worker thread that dies takes its half of the stream with it and says
-    // nothing, which is the worst shape a fault can have here: the session
-    // stays up, the counters for the other half keep climbing, and the only
-    // symptom is a viewer reporting that half of it is missing. That is
-    // exactly how a silent video failure was found, with audio flowing
-    // normally beside a picture that never started.
-    if let Ok(Err(e)) = video_thread.join() {
-        session.note(format!("video stopped: {e}"));
     }
-    if let Ok(Err(e)) = audio_thread.join() {
-        session.note(format!("audio stopped: {e}"));
-    }
+}
 
-    if result.is_ok() {
-        session.set_phase(Phase::Ended);
-    }
-    result
+/// Why `run_media` handed control back.
+enum Served<N> {
+    /// Another viewer is waiting to be added to the list.
+    Joined(N),
+    /// Nobody is watching any more, or the host stopped.
+    Ended(Result<(), String>),
 }
 
 /// Opens a capture for one process, and describes it for the read-out.

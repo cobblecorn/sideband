@@ -516,6 +516,35 @@ pub struct Feedback {
     pub sent_bitrate: u32,
 }
 
+impl Feedback {
+    /// The pessimistic combination of two viewers' reports.
+    ///
+    /// One stream serves everybody watching, so it has to suit whoever is
+    /// having the hardest time: the highest loss anyone reported, the lowest
+    /// estimate anyone offered, and every request for a picture from any of
+    /// them. Averaging would mean sending one viewer more than their
+    /// connection can carry, and the entire reason this exists is that doing
+    /// so does not soften the picture, it stops it.
+    ///
+    /// The send rate is not combined, because it is one number about this end
+    /// rather than a report from either of them.
+    pub fn worst_of(a: Self, b: Self) -> Self {
+        Self {
+            loss: match (a.loss, b.loss) {
+                (Some(x), Some(y)) => Some(x.max(y)),
+                (found, None) | (None, found) => found,
+            },
+            receiver_estimate: match (a.receiver_estimate, b.receiver_estimate) {
+                (Some(x), Some(y)) => Some(x.min(y)),
+                (found, None) | (None, found) => found,
+            },
+            picture_loss: a.picture_loss + b.picture_loss,
+            nacks: a.nacks + b.nacks,
+            sent_bitrate: a.sent_bitrate.max(b.sent_bitrate),
+        }
+    }
+}
+
 /// What the encoder should be doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Target {
@@ -573,9 +602,6 @@ pub struct Controller {
     /// The recent target rates, oldest first. Bounded at `AGREE_INTERVALS`,
     /// which is what makes "every second agreed" a question this can answer.
     recent: std::collections::VecDeque<u32>,
-    /// A size chosen by hand, which is obeyed from the first frame and never
-    /// reconsidered. For anyone who would rather pick than be adapted to.
-    fixed: Option<u32>,
     /// Consecutive seconds the receiver's estimate has sat below what is
     /// actually being sent. The counterpart to `last_estimate`: one catches an
     /// estimate falling, this one catches an estimate that has already fallen
@@ -600,7 +626,6 @@ impl Controller {
             since_change: 0,
             strain: u32::MAX,
             recent: std::collections::VecDeque::with_capacity(AGREE_INTERVALS),
-            fixed: env_scale(),
         }
     }
 
@@ -1399,18 +1424,6 @@ mod tests {
     }
 
     #[test]
-    fn a_hand_picked_size_is_never_touched() {
-        let mut c = Controller::new(START_BITRATE, 60);
-        c.fixed = Some(2);
-        c.divisor = 2;
-        for i in 0..500 {
-            c.bitrate = if i % 3 == 0 { 400_000 } else { 9_000_000 };
-            c.settle_size();
-        }
-        assert_eq!(c.divisor, 2);
-    }
-
-    #[test]
     fn the_picture_size_never_moves_on_its_own() {
         // Automatic sizing is gone, and this is what says so. Every rule for
         // deciding when to change resolution produced a picture that changed
@@ -1490,6 +1503,46 @@ mod tests {
 
         f.note_loss(0.0);
         assert_eq!(f.take().loss, Some(0.0));
+    }
+
+    #[test]
+    fn the_worst_report_of_several_viewers_is_the_one_that_counts() {
+        let good = Feedback {
+            loss: Some(0.0),
+            receiver_estimate: Some(8_000_000),
+            picture_loss: 0,
+            nacks: 0,
+            sent_bitrate: 5_000_000,
+        };
+        let struggling = Feedback {
+            loss: Some(0.2),
+            receiver_estimate: Some(700_000),
+            picture_loss: 3,
+            nacks: 40,
+            sent_bitrate: 5_000_000,
+        };
+
+        let both = Feedback::worst_of(good, struggling);
+        assert_eq!(both.loss, Some(0.2), "the worst loss anybody saw");
+        assert_eq!(both.receiver_estimate, Some(700_000), "the lowest estimate");
+        assert_eq!(both.picture_loss, 3, "any request for a picture counts");
+        assert_eq!(both.nacks, 40);
+    }
+
+    #[test]
+    fn a_viewer_reporting_nothing_does_not_erase_one_that_did() {
+        // Silence is not a clean report. Combining it as though it were would
+        // let a quiet viewer cancel out a struggling one.
+        let silent = Feedback { sent_bitrate: 5_000_000, ..Default::default() };
+        let struggling = Feedback {
+            loss: Some(0.3),
+            receiver_estimate: Some(600_000),
+            ..Default::default()
+        };
+
+        let both = Feedback::worst_of(silent, struggling);
+        assert_eq!(both.loss, Some(0.3));
+        assert_eq!(both.receiver_estimate, Some(600_000));
     }
 
     #[test]

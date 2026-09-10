@@ -463,6 +463,13 @@ impl NvencEncoder {
     }
 
     /// The bitrate the encoder is running at, in bits per second.
+    /// Force a real IDR on the next frame. Test hook, see
+    /// .
+    #[allow(dead_code)]
+    pub fn force_idr(&mut self) {
+        self.pending_idr = true;
+    }
+
     pub fn bitrate(&self) -> u32 {
         self.applied.0
     }
@@ -495,6 +502,8 @@ impl VideoEncoder for NvencEncoder {
     fn request_keyframe(&mut self) {
         self.pending_refresh = true;
     }
+
+
 }
 
 impl Drop for NvencEncoder {

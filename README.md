@@ -353,9 +353,14 @@ cargo test
 - **No periodic keyframes.** Forcing an IDR mid-stream against `rtc-rtp` 0.20.4
   breaks decoding outright. That is measured, not assumed. Loss recovery relies on
   NACK retransmission instead.
-- **One viewer per session.** A dropped connection ends the session and says so. A
-  source window closing does not - pick another application and the stream carries
-  on.
+- **Several people can watch the same link.** Each viewer gets its own encoder
+  session, which is why: a viewer arriving late has no reference frame, the only
+  thing that gives them one is a keyframe, and a forced keyframe does not survive
+  this pipeline. Measured with two watching, sending one for the newcomer took
+  *both* of them to zero frames a second. A fresh encoder opens with a keyframe of
+  its own, which is the one case known to work, so everybody is a first viewer.
+  The cost is an encode pass each; the gain is that each viewer also gets a rate
+  fitted to their own connection rather than the worst one in the room.
 - **No keyframes after the first one.** Forcing one mid-stream does not survive
   this pipeline, so recovery is rolling intra refresh instead: a band of the
   picture is re-encoded from scratch every couple of seconds, and a decoder in
