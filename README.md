@@ -232,6 +232,7 @@ signalling server, and it is exactly what running your own answers.
 | Encode | NVENC, fed the texture directly with no CPU readback or colour conversion |
 | Transport | WebRTC, pre-encoded H.264 + Opus |
 | Rate control | The viewer's REMB and receiver reports, read off the RTCP stream |
+| Recovery | NACK for what can be retransmitted, rolling intra refresh for the rest |
 | Pairing | Non-trickle SDP through a Worker, or served locally |
 
 Three invariants worth knowing before changing anything:
@@ -302,10 +303,13 @@ cargo test
 - **One viewer per session.** A dropped connection ends the session and says so. A
   source window closing does not - pick another application and the stream carries
   on.
-- **A viewer who freezes has to be sent a fresh link.** With no keyframe to
-  repair them with, a decoder broken by heavy loss stays broken, and the code
-  has already been spent. The rate control exists to keep that from happening
-  rather than to recover from it.
+- **No keyframes after the first one.** Forcing one mid-stream does not survive
+  this pipeline, so recovery is rolling intra refresh instead: a band of the
+  picture is re-encoded from scratch every couple of seconds, and a decoder in
+  any state converges within one cycle. Measured with 15% of frames discarded on
+  purpose, sustained: every surviving frame decoded, no freezes, and no picture
+  requests. The visible cost is a faint band sweeping the picture once after
+  heavy loss.
 - **Resolution never changes**, only bitrate and frame rate. A new resolution needs a
   new SPS, and this stream deliberately sends parameter sets exactly once.
 - **Packaged ("Store") applications may have no capturable audio.** Their window

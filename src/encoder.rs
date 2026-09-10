@@ -52,10 +52,30 @@ pub struct NvencEncoder {
     /// redone every frame.
     registered: HashMap<usize, *mut c_void>,
     pending_idr: bool,
+    /// A refresh cycle to begin on the next frame, because the viewer asked
+    /// for a picture it could decode.
+    pending_refresh: bool,
     /// Whether SPS/PPS have been sent. See `strip_parameter_sets`.
     sent_parameter_sets: bool,
     frames: u64,
 }
+
+/// How often a full intra refresh cycle begins, in frames.
+///
+/// About two and a half seconds at 60 fps. This is the worst case for how long
+/// a broken decoder stays broken, so it is the number that decides whether a
+/// viewer who loses a burst of packets waits a moment or waits for ever.
+const REFRESH_PERIOD: u32 = 150;
+
+/// How many frames one cycle is spread across.
+///
+/// The whole point. A keyframe puts an entire picture's worth of intra coded
+/// data in one frame, which on a constrained link is a burst the link cannot
+/// absorb, so the keyframe itself is what gets lost, and the viewer asks for
+/// another one, and the stream spends its bandwidth on keyframes nobody
+/// receives. Spreading the same refresh over a quarter of a second turns that
+/// burst into a barely visible rise in the ordinary frame size.
+const REFRESH_FRAMES: u32 = 15;
 
 /// Splits an Annex-B bitstream into NAL units, without their start codes.
 fn split_nals(au: &[u8]) -> Vec<(usize, usize)> {
@@ -167,10 +187,28 @@ impl NvencEncoder {
             // a compression win nobody watching a game will notice.
             config.frameIntervalP = 1;
 
-            // No periodic IDR. Keyframes are sent on connect and on RTCP PLI
-            // instead, which is both cheaper and more responsive than spraying
-            // them on a timer.
+            // No periodic IDR, and none on demand either. See
+            // `stream::KEYFRAME_INTERVAL`: a forced IDR mid-stream does not
+            // survive this pipeline, so recovery is done with intra refresh
+            // instead, which is what the block below sets up.
             config.gopLength = NVENC_INFINITE_GOPLENGTH;
+
+            // Rolling intra refresh, the reason a viewer can recover at all.
+            //
+            // Without it a decoder broken by loss stays broken for the rest of
+            // the session: NACK repairs what it can retransmit in time and
+            // nothing repairs the rest. With it, a band of intra coded
+            // macroblocks sweeps the picture every couple of seconds, so any
+            // decoder in any state converges on a correct picture within one
+            // cycle without a keyframe ever being sent.
+            //
+            // It costs a few percent of bitrate and, on a badly broken
+            // picture, shows as a band sweeping across once. Both are trades
+            // worth making against a stream that never comes back.
+            let h264 = &mut config.encodeCodecConfig.h264Config;
+            h264.set_enableIntraRefresh(1);
+            h264.intraRefreshPeriod = REFRESH_PERIOD;
+            h264.intraRefreshCnt = REFRESH_FRAMES;
 
             config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
             config.rcParams.averageBitRate = bitrate_bps;
@@ -232,6 +270,7 @@ impl NvencEncoder {
                 // The first frame must be an IDR or the viewer has nothing to
                 // decode against.
                 pending_idr: true,
+                pending_refresh: false,
                 sent_parameter_sets: false,
                 frames: 0,
             })
@@ -285,6 +324,7 @@ impl NvencEncoder {
             )?;
 
             let force_idr = std::mem::take(&mut self.pending_idr);
+            let refresh_now = std::mem::take(&mut self.pending_refresh);
 
             let mut pic = NV_ENC_PIC_PARAMS {
                 version: NV_ENC_PIC_PARAMS_VER,
@@ -303,6 +343,15 @@ impl NvencEncoder {
                 },
                 ..Default::default()
             };
+
+            // A viewer asking for a keyframe gets a refresh cycle started now
+            // rather than a keyframe. It repairs the same damage, and unlike a
+            // forced IDR it is a request this pipeline can actually carry: the
+            // measured failure was a viewer asking several times a second and
+            // each answer being too large to arrive.
+            if refresh_now && !force_idr {
+                pic.codecPicParams.h264PicParams.forceIntraRefreshWithFrameCnt = REFRESH_FRAMES;
+            }
 
             let status = (ENCODE_API.encode_picture)(self.encoder, &mut pic);
 
@@ -435,8 +484,16 @@ impl VideoEncoder for NvencEncoder {
         self.encode(&frame.frame, frame.timestamp_us).map(|_| ())
     }
 
+    /// What to do when the viewer says it cannot decode.
+    ///
+    /// Not an IDR. See `stream::KEYFRAME_INTERVAL` for the measurement: a
+    /// forced IDR mid-stream took a 64 fps stream down to 9.7 and produced
+    /// nearly four picture-loss requests a second, because the answer to
+    /// "I cannot decode" was a burst too big for the link that had just
+    /// dropped something. A refresh cycle repairs the same damage using
+    /// ordinary frames.
     fn request_keyframe(&mut self) {
-        self.pending_idr = true;
+        self.pending_refresh = true;
     }
 }
 
