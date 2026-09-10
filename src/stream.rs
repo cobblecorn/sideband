@@ -305,19 +305,29 @@ async fn relay_attempts(
 
         let answer = match poll_answer(relay, ticket, &session).await {
             Ok(answer) => answer,
-            Err(e) if e == "cancelled" => return Ok(()),
+            Err(e) if e == "cancelled" => {
+                webrtc.close().await;
+                return Ok(());
+            }
             // Nobody came before the relay's clock ran out. Publishing again
             // restarts that clock, so the code on screen keeps working rather
             // than quietly becoming a dead string of letters.
-            Err(_) => continue,
+            Err(_) => {
+                webrtc.close().await;
+                continue;
+            }
         };
 
         // Knowing the code is not enough. Someone has to say yes, or have said
         // in advance that they would.
         match approved(&answer, &session).await {
             Decision::Allowed => {}
-            Decision::Refused => return Err("you turned that viewer away".into()),
+            Decision::Refused => {
+                webrtc.close().await;
+                return Err("you turned that viewer away".into());
+            }
             Decision::Unanswered => {
+                webrtc.close().await;
                 session.note(
                     "nobody answered the prompt here, so that viewer was not let in.                      The same code still works: turn on auto admit if you are the one                      at the other end."
                         .to_owned(),
@@ -331,15 +341,33 @@ async fn relay_attempts(
 
         match tokio::time::timeout(CONNECT_TIMEOUT, webrtc.wait_connected()).await {
             Ok(()) => {
-                // Connected. Nothing about this session needs to remain
-                // fetchable, so it goes now rather than at its expiry.
-                destroy_session(relay, ticket).await;
+                failures = 0;
                 session.set_phase(Phase::Live);
-                return pump(&webrtc, keyframe, session).await;
+
+                // The session stays on the relay while this runs, so the code
+                // keeps working. It used to be deleted the moment a viewer
+                // connected, which is what made a code good for exactly one
+                // use: a viewer whose connection dropped could not come back
+                // without being handed a new one from the other machine.
+                // The code is spent here, and only here.
+                //
+                // Offering again under the same code after a session that
+                // actually streamed does not work: the second connection fails
+                // ICE every time, reliably, and closing the first one properly
+                // did not fix it. Rather than ship a reconnect that does not
+                // reconnect, this ends. The useful half is kept, which is that
+                // a *failed* attempt above leaves the code alive instead of
+                // burning it, so a viewer who does not get in first time can
+                // simply try again.
+                destroy_session(relay, ticket).await;
+                let outcome = pump(&webrtc, keyframe, Arc::clone(&session)).await;
+                webrtc.close().await;
+                return outcome;
             }
             // A peer connection cannot take a second answer once it has one,
             // so recovering means a whole new connection and a new offer.
             Err(_) => {
+                webrtc.close().await;
                 failures += 1;
                 continue;
             }

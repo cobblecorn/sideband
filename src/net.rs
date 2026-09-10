@@ -419,6 +419,18 @@ impl<P: PeerConnection> Session<P> {
             .map_err(|e| format!("could not set remote description: {e}"))
     }
 
+    /// Shuts the connection down and gives back what it is holding.
+    ///
+    /// Dropping is not enough. A peer connection owns a UDP socket and a live
+    /// ICE agent, and neither goes away because the last handle did: the agent
+    /// keeps answering connectivity checks on candidates the far end may still
+    /// have, from a session nobody is using any more. Offering again without
+    /// this left the old agent running beside the new one, and the second
+    /// connection failed ICE every time while the first had been fine.
+    pub async fn close(&self) {
+        let _ = self.pc.close().await;
+    }
+
     /// Resolves once the viewer's browser is actually connected.
     ///
     /// Checks the flag first and keeps checking, rather than trusting a single

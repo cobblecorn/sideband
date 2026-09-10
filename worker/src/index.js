@@ -40,7 +40,14 @@
 
 /// Long enough to read a code out over a call, short enough that a leaked one
 /// is dead before it is useful.
-const TTL_MS = 5 * 60 * 1000;
+// Twenty minutes, not five.
+//
+// Five was chosen for a code read aloud to somebody already waiting. The
+// ordinary case is nothing like that: a code is generated on one machine and
+// used on another, and the walk between them, or the message sent and not yet
+// read, is easily longer than five minutes. A code that dies before it is used
+// is not a security property, it is an errand.
+const TTL_MS = 20 * 60 * 1000;
 
 /// Excludes O/0/I/1/L, the characters people mishear and mistype. 31^6 is
 /// about 8.9e8, which is only meaningful alongside the rate limits below.
@@ -94,6 +101,20 @@ export class SignallingSession {
       case "put-offer": {
         if (!(await this.authorised(request))) return json({ error: "denied" }, 403);
         await store.put("offer", await request.text());
+
+        // A fresh offer re-arms the code, and only the host can publish one,
+        // because only the host holds the token. So the code works for as long
+        // as this machine is sharing and stops the moment it is not.
+        //
+        // It was spent on first use before. That is the right rule for a code
+        // handed to somebody else and the wrong one for the commonest case
+        // there is: one person, two devices, where every reconnect meant
+        // walking back to the first machine for a new one.
+        await store.put("claimed", false);
+
+        // And the clock restarts, so a stream outlasting the expiry does not
+        // have the relay delete the session out from under it.
+        await store.setAlarm(Date.now() + TTL_MS);
         return json({ ok: true });
       }
 
@@ -486,7 +507,10 @@ async function gather(pc, { minCandidates = 2, settle = 700, hardCap = 12000 } =
 async function attempt(code, onStatus) {
   onStatus('Looking up the stream…');
   const res = await fetch('/api/session/' + code + '/offer', { cache: 'no-store' });
-  if (res.status === 410) throw new Error('That code has already been used.');
+  // Somebody is on this code right now. That is no longer final: when a
+  // viewer leaves, the host publishes a new offer under the same code within a
+  // few seconds, so this is worth waiting through rather than giving up on.
+  if (res.status === 410) throw new Error('Someone is watching. Waiting…');
   if (res.status === 429) throw new Error('Too many attempts. Wait a moment.');
   if (res.status === 404) throw new Error('No stream with that code. It may have expired.');
   if (!res.ok) throw new Error('Could not reach the server.');
@@ -535,20 +559,29 @@ async function attempt(code, onStatus) {
 // One retry only, and only for failures that happen after the code was
 // accepted, a claimed or expired code will not become valid by asking again.
 async function connectWithRetry(code, onStatus, onFailure) {
-  // Two tries, and only for a failure that could plausibly succeed next time.
+  // Bounded, and bounded is the point.
   //
-  // This briefly retried much harder, waiting through "someone is watching" on
-  // the theory that the host would free the code up in a moment. When it did
-  // not, the viewer sat in a loop saying so, over and over, which is a worse
-  // way to fail than saying plainly that the code is finished.
-  for (let tryNo = 1; tryNo <= 2; tryNo++) {
+  // Two states look like failure and are not: the host rebuilding its offer
+  // after a viewer left, and a connection that simply did not take. Both clear
+  // within seconds. An earlier version waited through them with no limit and
+  // sat repeating itself for ever when they did not clear, which is a worse
+  // way to fail than saying so. Anything that cannot come right by waiting,
+  // a code that never existed or a rate limit, is not waited on at all.
+  const deadline = Date.now() + 25000;
+  for (;;) {
     try {
       return await attempt(code, onStatus);
     } catch (e) {
       if (window.pc) { try { window.pc.close(); } catch (_) {} }
-      const fatal = /already been used|already watching|expired|Too many/.test(e.message);
-      if (fatal || tryNo === 2) throw e;
-      onStatus('That did not take - trying once more…');
+      if (/expired|Too many|not valid|No stream/.test(e.message)) throw e;
+      if (Date.now() > deadline) {
+        throw new Error(/watching/.test(e.message)
+          ? 'Someone else is watching this one.'
+          : e.message);
+      }
+      onStatus(/watching/.test(e.message)
+        ? 'Waiting for the stream to free up…'
+        : 'That did not take - trying again…');
       await new Promise((r) => setTimeout(r, 1500));
     }
   }
