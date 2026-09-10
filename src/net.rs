@@ -41,6 +41,43 @@ use webrtc::peer_connection::{
 
 use crate::bwe::{Feedback, FeedbackWatcher, ViewerFeedback};
 
+/// The one address worth gathering candidates on.
+///
+/// Binding `0.0.0.0` gathers a candidate for every interface the machine has,
+/// which sounds thorough and is actively harmful. A developer's machine has
+/// several that go nowhere: a VirtualBox host-only adapter, a VPN client that
+/// is installed but idle, and a link-local address on every unplugged NIC.
+/// ICE cannot tell those apart from the real one, so it spends its time
+/// sending STUN from networks with no route to anywhere.
+///
+/// Measured, with the stack's own logging on:
+///
+///     Failed to write packet to 162.159.207.0:3478 from 192.168.56.1:53401:
+///     A socket operation was attempted to an unreachable network. (os 10051)
+///     [controlling]: Setting new connection state: Failed
+///
+/// 192.168.56.1 is VirtualBox. Every check went out of an adapter that cannot
+/// reach the internet. When the good pair happened to be tried first the
+/// connection came up anyway, which is why this looked intermittent rather
+/// than broken: sometimes slow, sometimes a connection that never completed.
+///
+/// So one address, the one the routing table would actually use. Nothing is
+/// sent to find it out: connecting a UDP socket only asks the kernel which
+/// local interface would carry a packet to the outside world.
+fn local_bind() -> String {
+    use std::net::UdpSocket;
+
+    UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| {
+            s.connect("8.8.8.8:80")?;
+            s.local_addr()
+        })
+        .map(|a| format!("{}:0", a.ip()))
+        // No route at all, which is a machine with no network rather than a
+        // machine with too many. Everything is the best guess left.
+        .unwrap_or_else(|_| "0.0.0.0:0".to_owned())
+}
+
 /// How long to wait for ICE gathering before sending what we have.
 const GATHER_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -307,7 +344,7 @@ pub async fn connect(
             keyframe: keyframe.clone(),
             lost: Arc::clone(&lost),
         }))
-        .with_udp_addrs(vec!["0.0.0.0:0"])
+        .with_udp_addrs(vec![local_bind()])
         .build()
         .await
         .map_err(|e| format!("could not build peer connection: {e}"))?;

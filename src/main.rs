@@ -39,7 +39,42 @@ use std::sync::Arc;
 use crate::session::{Phase, Session};
 use std::time::{Duration, Instant};
 
+/// Prints whatever the WebRTC stack has to say, when asked.
+///
+/// The stack logs through the `log` facade, and without a logger installed
+/// every one of those lines goes nowhere. That is fine until something inside
+/// it fails in a way nothing here can see, at which point the difference
+/// between a silent failure and a diagnosed one is this twenty lines.
+struct Stderr;
+
+impl log::Log for Stderr {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        eprintln!("  [{}] {}: {}", record.level(), record.target(), record.args());
+    }
+
+    fn flush(&self) {}
+}
+
+fn install_logger() {
+    let Ok(level) = std::env::var("SIDEBAND_LOG") else { return };
+    let level = match level.trim().to_ascii_lowercase().as_str() {
+        "trace" => log::LevelFilter::Trace,
+        "debug" => log::LevelFilter::Debug,
+        "info" => log::LevelFilter::Info,
+        "warn" => log::LevelFilter::Warn,
+        _ => log::LevelFilter::Error,
+    };
+    if log::set_boxed_logger(Box::new(Stderr)).is_ok() {
+        log::set_max_level(level);
+    }
+}
+
 fn main() {
+    install_logger();
     // Only when there are arguments: a bare double-click is the GUI, and
     // attaching a console there would flash one up for no reason.
     if std::env::args().len() > 1 {

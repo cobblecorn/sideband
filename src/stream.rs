@@ -349,20 +349,30 @@ async fn relay_attempts(
                 // connected, which is what made a code good for exactly one
                 // use: a viewer whose connection dropped could not come back
                 // without being handed a new one from the other machine.
-                // The code is spent here, and only here.
+                failures = 0;
+                session.set_phase(Phase::Live);
+
+                // The session stays on the relay while this runs, so the code
+                // keeps working and the viewer can come back to it.
                 //
-                // Offering again under the same code after a session that
-                // actually streamed does not work: the second connection fails
-                // ICE every time, reliably, and closing the first one properly
-                // did not fix it. Rather than ship a reconnect that does not
-                // reconnect, this ends. The useful half is kept, which is that
-                // a *failed* attempt above leaves the code alive instead of
-                // burning it, so a viewer who does not get in first time can
-                // simply try again.
-                destroy_session(relay, ticket).await;
+                // This did not work until the interface binding was fixed. A
+                // second connection gathered perfectly good candidates and
+                // then never completed, because ICE was sending its checks out
+                // of an adapter with no route to anywhere. See net::local_bind.
                 let outcome = pump(&webrtc, keyframe, Arc::clone(&session)).await;
+
+                // Handed back before the next one is built, so there is never
+                // more than one live ICE agent here.
                 webrtc.close().await;
-                return outcome;
+                if session.should_stop() {
+                    return outcome;
+                }
+
+                session.note(match &outcome {
+                    Ok(()) => "the viewer left. The same code still works.".to_owned(),
+                    Err(e) => format!("{e}. The same code still works."),
+                });
+                continue;
             }
             // A peer connection cannot take a second answer once it has one,
             // so recovering means a whole new connection and a new offer.

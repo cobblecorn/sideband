@@ -3423,6 +3423,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "eframe",
+ "log",
  "moq-nvenc",
  "rand",
  "rtc",
