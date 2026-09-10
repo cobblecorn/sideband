@@ -74,8 +74,26 @@ thing between them and your screen, so it is a per-machine choice and it is
 remembered.
 
 **Microphone** - off by default. **Ctrl+Alt+M** toggles it globally, so it works
-without leaving the game. A mic that is on and reading 0% is muted or on the wrong
-device.
+without leaving the game. Pick which one with **mic device**; the level meter runs
+whether or not the mic is live, so you can confirm you chose the right one without
+going live first.
+
+A meter reading 0% is not on its own a fault. A noise-gated microphone, which is
+what the vendor mixer suites set up by default, reads exactly zero until you
+speak and then jumps, and that is it working correctly. What the meter is for is
+the difference between that and a device that stays at zero while you are
+talking, which is the one you cannot hear by listening to yourself. `sideband
+mics` lists the capture devices and `sideband mic` shows the level of one.
+
+**Volume** - the captured application is amplified to something audible before it
+is sent, and held there as you switch between applications. This is not optional
+and there is no slider, because the level that reaches the viewer has almost
+nothing to do with the level you hear: your master volume, the per-application
+slider in the mixer and your headset's own amplifier are all downstream of what
+gets captured, and none of them are in it. Measured here, a game sat 11 dB below
+a chat application while both sounded normal in the room. Sent as captured, that
+is a viewer at full volume still straining to hear. Your microphone is mixed in
+afterwards at its own level, so a loud game never ducks your voice.
 
 **Quality** - there is no quality setting, because the right one is a property of
 the viewer's connection and neither of you knows it. A session opens at 2.5 Mbit/s
@@ -256,10 +274,15 @@ wide and would fringe rather than read.
 Each isolates one stage, which is how most of the bugs in this were found:
 
 ```
+sideband mics                 list the capture devices it can use
+sideband mic  [secs] [n]      listen to one and watch the level
 sideband audio  <pid> <secs>  that app's audio to a WAV, plus Opus stats
 sideband window <pid> <secs>  one captured frame to a BMP
 sideband encode <pid> <secs>  capture → pace → NVENC → out.h264
 ```
+
+`audio` deliberately records what the application produced, with no amplification,
+because the point of it is to show what actually came out of the capture.
 
 `encode` also retunes the encoder halfway through and reports each half separately,
 because a driver that accepts a rate change and ignores it would leave adaptive

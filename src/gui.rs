@@ -19,7 +19,7 @@ use crate::icons::IconCache;
 use crate::mark;
 use crate::session::{Phase, Rates, Session};
 use crate::settings::Settings;
-use crate::{hotkey, sources, stream};
+use crate::{hotkey, mic, sources, stream};
 
 const BG: Color32 = Color32::from_rgb(0x14, 0x18, 0x1d);
 const SURFACE: Color32 = Color32::from_rgb(0x1b, 0x20, 0x27);
@@ -82,6 +82,15 @@ pub struct App {
     auto_approve: bool,
     /// The saved counterpart, for the same reason as `saved_relay`.
     saved_auto_approve: bool,
+    /// Chosen capture device, by endpoint id. Empty means the system default.
+    mic_device: String,
+    saved_mic_device: String,
+    /// The devices offered in the picker, and when they were last looked up.
+    /// Enumerating touches COM, so it is not something to do every frame.
+    mics: Vec<mic::Device>,
+    mics_listed: Instant,
+    /// Whether the microphone picker is open.
+    choosing_mic: bool,
     session: Option<Arc<Session>>,
     rates: Rates,
     /// Whether the source list is expanded. Mirrored so the viewport is only
@@ -114,6 +123,11 @@ impl Default for App {
             saved_relay: remembered,
             auto_approve: settings.auto_approve,
             saved_auto_approve: settings.auto_approve,
+            mic_device: settings.mic_device.clone(),
+            saved_mic_device: settings.mic_device,
+            mics: Vec::new(),
+            mics_listed: Instant::now() - REFRESH_EVERY * 2,
+            choosing_mic: false,
             session: None,
             rates: Rates::default(),
             picking: false,
@@ -218,12 +232,21 @@ impl App {
     /// a file that will eventually be caught half written.
     fn remember(&mut self) {
         let relay = self.relay.trim().to_owned();
-        if relay == self.saved_relay && self.auto_approve == self.saved_auto_approve {
+        if relay == self.saved_relay
+            && self.auto_approve == self.saved_auto_approve
+            && self.mic_device == self.saved_mic_device
+        {
             return;
         }
-        Settings { relay: relay.clone(), auto_approve: self.auto_approve }.save();
+        Settings {
+            relay: relay.clone(),
+            auto_approve: self.auto_approve,
+            mic_device: self.mic_device.clone(),
+        }
+        .save();
         self.saved_relay = relay;
         self.saved_auto_approve = self.auto_approve;
+        self.saved_mic_device = self.mic_device.clone();
     }
 
     fn start(&mut self) {
@@ -296,15 +319,16 @@ impl eframe::App for App {
         // honoured, the bottom edge drags freely and leaves a band of empty
         // background under the strip, because there is nothing below it to
         // reveal. Correcting the size each frame is what actually holds it.
-        let wanted_height = if self.picking { HEIGHT_PICKING } else { HEIGHT_STRIP };
+        let expanded = self.picking || self.choosing_mic;
+        let wanted_height = if expanded { HEIGHT_PICKING } else { HEIGHT_STRIP };
         let viewport = ui.ctx().viewport_rect();
-        let mode_changed = self.picking != self.was_picking;
+        let mode_changed = expanded != self.was_picking;
 
         // A tolerance, because the reported size and the requested one differ
         // by a fraction under some display scalings; reacting to that would
         // fight itself every frame.
         if mode_changed || (viewport.height() - wanted_height).abs() > 2.0 {
-            self.was_picking = self.picking;
+            self.was_picking = expanded;
             let width = viewport.width().clamp(MIN_WIDTH, MAX_WIDTH);
 
             // Raise the ceiling before asking for the new size, then lower the
@@ -324,8 +348,9 @@ impl eframe::App for App {
             )));
         }
 
-        if self.picking && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if expanded && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.picking = false;
+            self.choosing_mic = false;
         }
 
         let phase = self.session.as_ref().map(|s| s.phase());
@@ -481,6 +506,9 @@ impl App {
         if self.picking {
             ui.add_space(8.0);
             self.source_list(ui);
+        } else if self.choosing_mic {
+            ui.add_space(8.0);
+            self.mic_list(ui);
         }
     }
 
@@ -582,6 +610,7 @@ impl App {
 
         if combo_field(ui, &label, chosen, self.picking, texture.as_ref()).clicked() {
             self.picking = !self.picking;
+            self.choosing_mic = false;
         }
 
         let detail = if running {
@@ -725,6 +754,21 @@ impl App {
                 self.remember();
             }
 
+            // Enabled at all times, including before a session starts: the
+            // moment you want to choose a microphone is before you are live,
+            // not while somebody is waiting to hear you.
+            if pill(ui, "mic device", self.choosing_mic, true)
+                .on_hover_text("choose which microphone to use")
+                .clicked()
+            {
+                self.choosing_mic = !self.choosing_mic;
+                self.picking = false;
+                if self.choosing_mic {
+                    self.mics = mic::devices();
+                    self.mics_listed = Instant::now();
+                }
+            }
+
             let paused = session.as_ref().is_some_and(|s| s.paused());
             if pill(ui, if paused { "resume" } else { "pause" }, paused, live)
                 .on_hover_text("hold the picture without dropping the viewer")
@@ -755,6 +799,62 @@ impl App {
 }
 
 impl App {
+    /// The capture devices, shown while the microphone picker is open.
+    ///
+    /// Offered because the system default is often wrong on a machine with a
+    /// headset and any vendor mixer suite installed, and because there is no
+    /// way to tell a wrong device from a muted one by listening: it opens
+    /// without complaint and delivers silence. The meter in the strip keeps
+    /// running while this is open, so picking one and speaking is enough to
+    /// confirm it, without going live first.
+    fn mic_list(&mut self, ui: &mut egui::Ui) {
+        let mut chosen: Option<String> = None;
+
+        egui::Frame::new()
+            .fill(SURFACE)
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| {
+                if self.mics.is_empty() {
+                    ui.label(
+                        RichText::new("no capture devices found").color(MUTED).size(11.0),
+                    );
+                    return;
+                }
+
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.style_mut().spacing.item_spacing.y = 3.0;
+
+                    // An explicit entry for "whatever Windows says", so the
+                    // choice can be given back rather than only changed.
+                    if mic_row(ui, "System default", "", self.mic_device.is_empty()).clicked() {
+                        chosen = Some(String::new());
+                    }
+
+                    for d in &self.mics {
+                        let note = if d.default { "system default" } else { "" };
+                        if mic_row(ui, &d.name, note, self.mic_device == d.id).clicked() {
+                            chosen = Some(d.id.clone());
+                        }
+                    }
+                });
+            });
+
+        if let Some(id) = chosen {
+            self.mic_device = id;
+            self.choosing_mic = false;
+            self.remember();
+
+            // A running session keeps the device it opened. Swapping capture
+            // devices under a live stream would mean tearing down the mic
+            // thread mid-sentence, and the setting is read when the next one
+            // starts, which is soon enough for something you change once.
+            if let Some(s) = &self.session {
+                s.note("microphone changed, it takes effect on the next session".to_owned());
+            }
+        }
+    }
+
     /// The expanded list, shown only while picking.
     fn source_list(&mut self, ui: &mut egui::Ui) {
         let mut chosen: Option<u32> = None;
@@ -1122,14 +1222,22 @@ fn mic_meter(ui: &mut egui::Ui, session: &Session) {
         return;
     }
 
-    let on = session.mic_on();
-    // A level meter rather than just a state: a mic that is on and reading
-    // nothing is the failure people otherwise discover mid-conversation.
-    let peak = if on { session.mic_peak() } else { 0.0 };
+    // Shown whether or not the microphone is live.
+    //
+    // It used to read zero while muted, which meant the one question people
+    // have, "is this even the right device", could only be answered by going
+    // live and asking the person on the other end. A muted meter that still
+    // moves answers it here.
+    let peak = session.mic_peak();
+    let name = session.mic_name();
+
     ui.horizontal(|ui| {
         ui.label(RichText::new("mic").color(FAINT).size(10.0));
-        meter_bar(ui, peak, 150.0);
+        meter_bar(ui, peak, 120.0);
     });
+    if !name.is_empty() {
+        ui.label(RichText::new(truncate(&name, 38)).color(FAINT).size(9.0));
+    }
 }
 
 fn meter_bar(ui: &mut egui::Ui, peak: f32, width: f32) {
@@ -1147,6 +1255,47 @@ fn meter_bar(ui: &mut egui::Ui, peak: f32, width: f32) {
         filled.set_width(rect.width() * peak.clamp(0.02, 1.0));
         ui.painter().rect_filled(filled, radius, ACCENT);
     }
+}
+
+fn mic_row(ui: &mut egui::Ui, name: &str, note: &str, selected: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 30.0),
+        egui::Sense::click(),
+    );
+
+    let fill = if selected || response.hovered() { SURFACE_HI } else { BG };
+    let radius = egui::CornerRadius::same(3);
+    ui.painter().rect_filled(rect, radius, fill);
+    if selected {
+        ui.painter().rect_stroke(
+            rect,
+            radius,
+            egui::Stroke::new(1.0, ACCENT),
+            egui::StrokeKind::Inside,
+        );
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    ui.painter().text(
+        rect.left_center() + egui::vec2(10.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        truncate(name, 60),
+        egui::FontId::proportional(12.0),
+        INK,
+    );
+    if !note.is_empty() {
+        ui.painter().text(
+            rect.right_center() - egui::vec2(10.0, 0.0),
+            egui::Align2::RIGHT_CENTER,
+            note,
+            egui::FontId::proportional(10.0),
+            FAINT,
+        );
+    }
+
+    response
 }
 
 /// Spaces a code out so it is easy to read aloud over a call.

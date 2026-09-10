@@ -41,6 +41,7 @@ use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObj
 use windows::Win32::System::Variant::VT_BLOB;
 
 use crate::audio::{OpusPacket, OpusStream};
+use crate::gain::Gain;
 use crate::mic::{mix_into, Mic};
 use crate::session::Session;
 use crate::wav::WavWriter;
@@ -85,8 +86,8 @@ pub struct Capture {
     started: Instant,
     frames_written: u64,
     gap_frames: u64,
-    /// Loudest absolute sample seen since the last `take_peak`, before the
-    /// microphone is mixed in.
+    /// Loudest absolute sample seen since the last `take_peak`, measured after
+    /// the lift and before the microphone is mixed in.
     peak: u32,
 }
 
@@ -201,6 +202,7 @@ impl Capture {
         mut wav: Option<&mut WavWriter>,
         opus: &mut OpusStream,
         mic: Option<&Mic>,
+        mut gain: Option<&mut Gain>,
     ) -> std::result::Result<Vec<OpusPacket>, String> {
         unsafe {
             WaitForSingleObject(self.packet_event, 200);
@@ -264,13 +266,30 @@ impl Capture {
                     std::slice::from_raw_parts(data as *const i16, samples).to_vec()
                 };
 
-                // Measured here, before the mix: this is the *application's*
-                // level, and the whole use of it is answering whether the
-                // application is making any sound. Talking into the mic must
-                // not make a silent game look live.
-                self.peak = self.peak.max(
-                    pcm.iter().map(|s| s.unsigned_abs() as u32).max().unwrap_or(0),
-                );
+                // Lifted here, before anything else touches the buffer.
+                //
+                // What the application rendered is not what its own listener
+                // hears: the master volume, the mixer's per-application slider
+                // and the headset's amplifier are all downstream of this and
+                // none of them are in the capture. Sent as-is, a game that
+                // sounds fine in the room arrives twenty decibels down.
+                //
+                // Only the application audio goes through it. The microphone
+                // is mixed in below at its own level, because levelling the
+                // two together would duck the voice every time the game got
+                // loud.
+                let lifted = match gain.as_deref_mut() {
+                    Some(g) => g.apply(&mut pcm),
+                    None => {
+                        pcm.iter().map(|s| s.unsigned_abs() as f32).fold(0.0, f32::max) / 32767.0
+                    }
+                };
+
+                // Measured after the lift, because the meter answers "will
+                // they hear this", which is a question about what is being
+                // sent. Talking into the mic must not make a silent game look
+                // live, so this is still before the mix.
+                self.peak = self.peak.max((lifted * i16::MAX as f32) as u32);
 
                 if let Some(m) = mic {
                     if m.is_on() {
@@ -354,7 +373,7 @@ pub fn record_to_wav(
         let mut opus = OpusStream::new(128_000)?;
 
         while !stop.load(Ordering::Relaxed) {
-            cap.pump(Some(&mut wav), &mut opus, None)?;
+            cap.pump(Some(&mut wav), &mut opus, None, None)?;
         }
 
         let ratio = cap.silence_ratio();
@@ -452,6 +471,10 @@ pub fn stream_opus(
 
     let result = (|| {
         let mut opus = OpusStream::new(128_000)?;
+        // Owned out here rather than by the capture, so switching application
+        // does not drop the amplifier back to unity and make the first second
+        // of the new source inaudible while it works the level out again.
+        let mut gain = Gain::default();
         let mut cap: Option<Capture> = None;
         let mut listening: u32 = 0;
         let mut retry_at = Instant::now();
@@ -499,7 +522,7 @@ pub fn stream_opus(
             }
 
             match cap.as_mut() {
-                Some(c) => match c.pump(None, &mut opus, mic.as_deref()) {
+                Some(c) => match c.pump(None, &mut opus, mic.as_deref(), Some(&mut gain)) {
                     Ok(got) => {
                         packets.extend(got);
                         // On a timer rather than every pass: `pump` returns

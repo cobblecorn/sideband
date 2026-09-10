@@ -21,6 +21,13 @@ pub struct Settings {
     /// gets to see your screen is one where the safe reading of a typo is
     /// "no".
     pub auto_approve: bool,
+    /// The capture device to use, by endpoint id. Empty means whatever
+    /// Windows considers the default.
+    ///
+    /// The id rather than the name, because names are neither unique nor
+    /// stable: this machine has two devices both called "SteelSeries Sonar,
+    /// Microphone".
+    pub mic_device: String,
 }
 
 impl Settings {
@@ -39,6 +46,7 @@ impl Settings {
                 match key.as_str() {
                     "relay" => settings.relay = value,
                     "auto_approve" => settings.auto_approve = truthy(&value),
+                    "mic_device" => settings.mic_device = value,
                     _ => {}
                 }
             }
@@ -71,9 +79,10 @@ impl Settings {
 
     fn serialise(&self) -> String {
         format!(
-            "# Sideband. Written by the app; safe to edit or delete.\nrelay = {}\nauto_approve = {}\n",
+            "# Sideband. Written by the app; safe to edit or delete.\nrelay = {}\nauto_approve = {}\nmic_device = {}\n",
             self.relay.trim(),
             self.auto_approve,
+            self.mic_device.trim(),
         )
     }
 }
@@ -126,8 +135,26 @@ mod tests {
     }
 
     #[test]
+    fn a_chosen_microphone_survives_a_round_trip() {
+        let written = Settings {
+            mic_device: "{0.0.1.00000000}.{abc-123}".into(),
+            ..Default::default()
+        }
+        .serialise();
+        assert_eq!(
+            value(&written, "mic_device").as_deref(),
+            Some("{0.0.1.00000000}.{abc-123}")
+        );
+
+        // And the absence of a choice reads back as an absence, not as the
+        // word "default" or anything else that could match a real id.
+        let none = Settings::default().serialise();
+        assert_eq!(value(&none, "mic_device").as_deref(), Some(""));
+    }
+
+    #[test]
     fn auto_approve_survives_a_round_trip() {
-        let on = Settings { relay: String::new(), auto_approve: true }.serialise();
+        let on = Settings { auto_approve: true, ..Default::default() }.serialise();
         assert_eq!(value(&on, "auto_approve").as_deref(), Some("true"));
 
         let off = Settings::default().serialise();

@@ -78,6 +78,9 @@ pub struct Session {
     mic_available: AtomicBool,
     /// Peak since the last read, as a fraction of full scale times 1000.
     mic_peak: AtomicU32,
+    /// The capture device actually in use, for the window to show. Knowing
+    /// which one is live is most of the answer when a microphone reads zero.
+    mic_name: Mutex<String>,
 
     /// The same measure for the shared application's own audio.
     ///
@@ -119,6 +122,7 @@ impl Default for Session {
             mic_on: AtomicBool::new(false),
             mic_available: AtomicBool::new(false),
             mic_peak: AtomicU32::new(0),
+            mic_name: Mutex::new(String::new()),
             app_peak: AtomicU32::new(0),
             app_audio_ok: AtomicBool::new(true),
             video_kbps: AtomicU32::new(0),
@@ -283,6 +287,16 @@ impl Session {
     /// stealing readings from itself.
     pub fn mic_peak(&self) -> f32 {
         self.mic_peak.load(Ordering::Relaxed) as f32 / 1000.0
+    }
+
+    pub fn mic_name(&self) -> String {
+        self.mic_name.lock().map(|n| n.clone()).unwrap_or_default()
+    }
+
+    pub fn set_mic_name(&self, name: String) {
+        if let Ok(mut n) = self.mic_name.lock() {
+            *n = name;
+        }
     }
 
     pub fn set_mic_peak(&self, level: f32) {

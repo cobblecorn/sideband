@@ -15,6 +15,7 @@ mod audio;
 mod bwe;
 mod capture;
 mod encoder;
+mod gain;
 mod gui;
 mod hotkey;
 mod icons;
@@ -146,6 +147,63 @@ fn run() -> Result<(), String> {
             let exe = exe_for(pid);
             capture(pid, &exe, Some(secs))
         }
+        // Which microphones exist, and which one is being used. The answer
+        // to "the meter reads nothing" is almost always in this list.
+        "mics" => {
+            let list = mic::devices();
+            let chosen = settings::Settings::load().mic_device;
+            if list.is_empty() {
+                println!("\n  no capture devices found\n");
+                return Ok(());
+            }
+            println!();
+            for (i, d) in list.iter().enumerate() {
+                let mut tags = Vec::new();
+                if d.default {
+                    tags.push("system default");
+                }
+                if !chosen.is_empty() && chosen == d.id {
+                    tags.push("selected");
+                }
+                let note = if tags.is_empty() {
+                    String::new()
+                } else {
+                    format!("  ({})", tags.join(", "))
+                };
+                println!("  {:>3}  {}{note}", i + 1, d.name);
+            }
+            if chosen.is_empty() {
+                println!("\n  Nothing chosen, so the system default is used.");
+            }
+            println!("\n  Pick one in the window; it is remembered.\n");
+            Ok(())
+        }
+
+        // Listen to the chosen microphone and report what it hears, with
+        // no stream and nobody watching. The question "is this the right
+        // device" should not require a viewer on the other end to answer.
+        "mic" => {
+            let secs = match args.get(1) {
+                Some(a) => parse_secs(a)?,
+                None => 5.0,
+            };
+            let which = match args.get(2) {
+                Some(a) => {
+                    let n: usize = a.parse().map_err(|_| "device must be a number from 'mics'")?;
+                    let list = mic::devices();
+                    let d = list
+                        .get(n.wrapping_sub(1))
+                        .ok_or("no device with that number, run 'sideband mics'")?;
+                    Some(d.id.clone())
+                }
+                None => {
+                    let chosen = settings::Settings::load().mic_device;
+                    if chosen.is_empty() { None } else { Some(chosen) }
+                }
+            };
+            listen(which, secs)
+        }
+
         "window" if args.len() == 3 => capture_window(parse_pid(&args[1])?, parse_secs(&args[2])?),
         "encode" if args.len() == 3 => encode_window(parse_pid(&args[1])?, parse_secs(&args[2])?),
 
@@ -204,6 +262,8 @@ const USAGE: &str = "  sideband                      pick a window and share it
   sideband share  [pid] [relay] pair by code through a relay
   sideband stream [pid] [port]  serve the viewer page yourself
 
+  sideband mics                 list the microphones it can use
+  sideband mic  [secs] [n]      listen to one and show the level
   sideband audio  <pid> <secs>  record that app's audio to a WAV
   sideband window <pid> <secs>  capture a frame to a BMP
   sideband encode <pid> <secs>  encode to out.h264
@@ -228,6 +288,56 @@ fn stdin_lines() -> std::sync::mpsc::Receiver<String> {
         }
     });
     rx
+}
+
+/// Opens a capture device and prints its level once a second.
+///
+/// A meter with nothing attached to it. The commonest microphone fault is not
+/// an error at all: the wrong device opens perfectly and delivers silence, and
+/// on a machine with a headset and a vendor mixer suite the system default is
+/// often exactly that. This is how you find out which one hears you.
+fn listen(device: Option<String>, seconds: f64) -> Result<(), String> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let microphone = mic::Mic::start_on(device, Arc::clone(&stop));
+
+    if !microphone.available() {
+        stop.store(true, Ordering::Relaxed);
+        return Err("could not open that microphone".into());
+    }
+
+    let name = microphone.opened().map_or("?".to_owned(), |d| d.name.clone());
+    println!("\n  listening to {name}");
+    println!("  Say something.\n");
+
+    let started = Instant::now();
+    let mut loudest = 0.0f32;
+    while started.elapsed().as_secs_f64() < seconds {
+        std::thread::sleep(Duration::from_millis(1000));
+        let peak = microphone.take_peak();
+        loudest = loudest.max(peak);
+
+        // A bar, because a column of numbers is harder to read than a shape
+        // that moves when you talk.
+        let filled = (peak * 40.0).round() as usize;
+        let bar: String =
+            std::iter::repeat_n('#', filled).chain(std::iter::repeat_n('.', 40 - filled.min(40))).collect();
+        println!("  [{bar}]  {:>3.0}%", peak * 100.0);
+    }
+    stop.store(true, Ordering::Relaxed);
+
+    // Carefully worded. A noise-gated microphone reads exactly zero until
+    // someone speaks, which is most of them once a vendor mixer suite has been
+    // through the machine, so silence here is not evidence of a fault and must
+    // not be reported as one.
+    if loudest < 0.01 {
+        println!("\n  Nothing heard, which means one of two things.");
+        println!("  If you were speaking, this is the wrong device: run 'sideband mics'");
+        println!("  and try another with 'sideband mic 5 <number>'.");
+        println!("  If you were not, try again and talk. A gated mic reads zero until you do.\n");
+    } else {
+        println!("\n  Peak {:.0}%. That one hears you.\n", loudest * 100.0);
+    }
+    Ok(())
 }
 
 fn print_sources(list: &[sources::Source]) {

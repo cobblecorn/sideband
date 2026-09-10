@@ -453,7 +453,17 @@ async fn pump<P: webrtc::peer_connection::PeerConnection>(
     let mut controller = bwe::Controller::new(bwe::START_BITRATE, FPS);
     let quality = bwe::Quality::new(controller.target());
 
-    let microphone = Arc::new(mic::Mic::start(Arc::clone(&stop)));
+    // Whichever device was chosen in the window, or the default if that one
+    // has since been unplugged. Read here rather than passed in, so the
+    // command line honours the same choice.
+    let chosen_mic = crate::settings::Settings::load().mic_device;
+    let microphone = Arc::new(mic::Mic::start_on(
+        Some(chosen_mic).filter(|id| !id.is_empty()),
+        Arc::clone(&stop),
+    ));
+    if let Some(device) = microphone.opened() {
+        session.set_mic_name(device.name.clone());
+    }
     session.set_mic_available(microphone.available());
     if microphone.available() {
         let ui = Arc::clone(&session);

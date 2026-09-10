@@ -15,7 +15,7 @@ serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 ureq = { version = "3.4.0", default-features = false, features = ["json", "rustls"] }
 webrtc = "0.20.4"
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_Media_Audio", "Win32_UI_WindowsAndMessaging", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Security", "Graphics_Capture", "Graphics_DirectX_Direct3D11", "Win32_Graphics_Direct3D11", "Win32_Graphics_Direct3D", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_System_WinRT_Direct3D11", "Win32_System_WinRT_Graphics_Capture", "Win32_UI_Input_KeyboardAndMouse", "Win32_Media_KernelStreaming", "Win32_System_Console", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_Media_Audio", "Win32_UI_WindowsAndMessaging", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Security", "Graphics_Capture", "Graphics_DirectX_Direct3D11", "Win32_Graphics_Direct3D11", "Win32_Graphics_Direct3D", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_System_WinRT_Direct3D11", "Win32_System_WinRT_Graphics_Capture", "Win32_UI_Input_KeyboardAndMouse", "Win32_Media_KernelStreaming", "Win32_System_Console", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_Devices_FunctionDiscovery", "Win32_UI_Shell_PropertiesSystem"] }
 windows-core = "0.62.2"
 
 [build-dependencies]
