@@ -94,25 +94,6 @@ export class SignallingSession {
       case "put-offer": {
         if (!(await this.authorised(request))) return json({ error: "denied" }, 403);
         await store.put("offer", await request.text());
-
-        // Publishing a fresh offer re-arms the session, and only the host can
-        // do it. A code was previously spent the moment anybody used it, which
-        // is the right rule for a code handed to somebody else and the wrong
-        // one for the commonest case there is: one person, two devices, trying
-        // to get a picture onto the other one. Every reconnect meant going
-        // back to the first machine for a new code.
-        //
-        // The code now lasts as long as the host is offering, and no longer.
-        // It stops working the moment the host stops, because the session is
-        // deleted then, and it cannot be re-armed by anyone but the holder of
-        // the token, which never leaves the host process.
-        await store.put("claimed", false);
-
-        // The clock restarts too. Without this a stream lasting longer than
-        // the expiry would have the relay delete the session out from under
-        // it, and the code would stop working mid-session for no visible
-        // reason.
-        await store.setAlarm(Date.now() + TTL_MS);
         return json({ ok: true });
       }
 
@@ -397,7 +378,14 @@ function page(prefill) {
   body { margin:0; height:100vh; background:#14181d; color:#e4e9ee;
     font:15px/1.5 ui-sans-serif,system-ui,"Segoe UI",sans-serif; display:grid; place-items:center; }
   #stage { width:100%; height:100%; display:grid; place-items:center; }
-  video { max-width:100%; max-height:100vh; display:none; background:#000; }
+  /* An explicit width as well as a maximum, and that is not a detail.
+     With only a maximum, a video is laid out at its own pixel size, so a
+     stream sent at a reduced resolution arrived as a postage stamp in the
+     middle of a black page rather than as a slightly soft full sized
+     picture. Every argument for sending a smaller picture assumed the
+     browser would scale it back up, and it never had any reason to. */
+  video { width:100%; height:100vh; object-fit:contain;
+          display:none; background:#000; }
   #panel { text-align:center; }
   h1 { font-size:15px; font-weight:600; letter-spacing:.14em; text-transform:uppercase;
     color:#f0a93b; margin:0 0 6px; }
@@ -498,11 +486,7 @@ async function gather(pc, { minCandidates = 2, settle = 700, hardCap = 12000 } =
 async function attempt(code, onStatus) {
   onStatus('Looking up the stream…');
   const res = await fetch('/api/session/' + code + '/offer', { cache: 'no-store' });
-  // 410 means somebody is on this code right now, which is no longer the end
-  // of the story. The host keeps the code alive for as long as it is sharing
-  // and re-arms it whenever a viewer leaves, so this is usually a few seconds
-  // of the host building a fresh offer rather than a code that is finished.
-  if (res.status === 410) throw new Error('Someone is watching. Retrying…');
+  if (res.status === 410) throw new Error('That code has already been used.');
   if (res.status === 429) throw new Error('Too many attempts. Wait a moment.');
   if (res.status === 404) throw new Error('No stream with that code. It may have expired.');
   if (!res.ok) throw new Error('Could not reach the server.');
@@ -551,28 +535,21 @@ async function attempt(code, onStatus) {
 // One retry only, and only for failures that happen after the code was
 // accepted, a claimed or expired code will not become valid by asking again.
 async function connectWithRetry(code, onStatus, onFailure) {
-  // Two kinds of failure, and only one of them is worth waiting through.
+  // Two tries, and only for a failure that could plausibly succeed next time.
   //
-  // A code that never existed, or a rate limit, will not become valid by
-  // asking again. But "someone is watching" and a connection that did not
-  // take are both states the host climbs out of by itself within seconds:
-  // when a viewer leaves, the host publishes a new offer under the same code.
-  // Giving up on the first refusal is what made reconnecting mean walking
-  // back to the other machine for a fresh code.
-  const deadline = Date.now() + 40000;
-  let tryNo = 0;
-  for (;;) {
-    tryNo++;
+  // This briefly retried much harder, waiting through "someone is watching" on
+  // the theory that the host would free the code up in a moment. When it did
+  // not, the viewer sat in a loop saying so, over and over, which is a worse
+  // way to fail than saying plainly that the code is finished.
+  for (let tryNo = 1; tryNo <= 2; tryNo++) {
     try {
       return await attempt(code, onStatus);
     } catch (e) {
       if (window.pc) { try { window.pc.close(); } catch (_) {} }
-      const fatal = /expired|Too many|not valid/.test(e.message);
-      if (fatal || Date.now() > deadline) throw e;
-      onStatus(/watching/.test(e.message)
-        ? 'Someone is watching. Waiting for the stream to free up…'
-        : 'That did not take - trying again…');
-      await new Promise((r) => setTimeout(r, 2000));
+      const fatal = /already been used|already watching|expired|Too many/.test(e.message);
+      if (fatal || tryNo === 2) throw e;
+      onStatus('That did not take - trying once more…');
+      await new Promise((r) => setTimeout(r, 1500));
     }
   }
 }

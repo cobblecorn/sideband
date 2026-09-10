@@ -331,28 +331,11 @@ async fn relay_attempts(
 
         match tokio::time::timeout(CONNECT_TIMEOUT, webrtc.wait_connected()).await {
             Ok(()) => {
-                failures = 0;
+                // Connected. Nothing about this session needs to remain
+                // fetchable, so it goes now rather than at its expiry.
+                destroy_session(relay, ticket).await;
                 session.set_phase(Phase::Live);
-
-                // The session deliberately stays on the relay while this runs.
-                // It used to be deleted the moment a viewer connected, on the
-                // grounds that nothing needed to be fetchable any more, and
-                // that is what made a code good for exactly one use: a viewer
-                // whose connection dropped could not come back without being
-                // handed a new one from the other machine.
-                let outcome = pump(&webrtc, keyframe, Arc::clone(&session)).await;
-
-                if session.should_stop() {
-                    return outcome;
-                }
-
-                // The viewer left and this end did not. Offer again under the
-                // same code so they can simply reload.
-                session.note(match &outcome {
-                    Ok(()) => "the viewer left. The same code still works.".to_owned(),
-                    Err(e) => format!("{e}. The same code still works."),
-                });
-                continue;
+                return pump(&webrtc, keyframe, session).await;
             }
             // A peer connection cannot take a second answer once it has one,
             // so recovering means a whole new connection and a new offer.

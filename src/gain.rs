@@ -35,12 +35,18 @@
 /// limiter working on every transient, and the difference is inaudible.
 const TARGET_PEAK: f32 = 0.71;
 
-/// The most the signal may be lifted, about +24 dB.
+/// The most the signal may be lifted, about +15 dB.
 ///
 /// A ceiling exists because the alternative is that a silent application gets
 /// amplified until its noise floor is the loudest thing on the stream. Room
-/// tone and電 hum are not what anybody is trying to hear.
-const MAX_GAIN: f32 = 16.0;
+/// tone and mains hum are not what anybody is trying to hear.
+///
+/// This was twice as much, and twice as much was audible as hiss on the
+/// viewer's end. Every source has a noise floor, and a levelling amplifier
+/// given enough range will find it and bring it up to speaking volume
+/// during any quiet passage. Fifteen decibels still rescues a game that was
+/// inaudible; twenty four also rescued the hum underneath it.
+const MAX_GAIN: f32 = 6.0;
 
 /// Never quieter than what the application produced.
 ///
@@ -52,9 +58,15 @@ const MIN_GAIN: f32 = 1.0;
 /// Below this the envelope is treated as nothing at all, and the gain holds
 /// where it is instead of climbing.
 ///
-/// About -66 dBFS. Without it, every pause would wind the gain to maximum and
-/// the next sound would arrive as a slam that the limiter then has to flatten.
-const NOISE_FLOOR: f32 = 0.0005;
+/// About -48 dBFS, raised from -66. The old figure sat below the noise floor
+/// of most real sources, so hiss counted as signal worth chasing: the gain
+/// climbed through every quiet moment and the viewer heard the room. What is
+/// wanted is a threshold above the noise and below anything anybody is
+/// actually trying to listen to.
+///
+/// It also stops every pause winding the gain to maximum, so the next sound
+/// does not arrive as a slam for the limiter to flatten.
+const NOISE_FLOOR: f32 = 0.004;
 
 /// Per-sample release of the peak envelope, a time constant of about 1.5
 /// seconds at 48 kHz.
@@ -158,8 +170,30 @@ mod tests {
         g.apply(&mut pcm);
 
         let out = settled(&pcm);
-        assert!(out > 0.4, "should be audible, reached {out}");
+        assert!(out > 0.25, "should be audible, reached {out}");
         assert!(out <= 1.0, "must not exceed full scale, reached {out}");
+    }
+
+    #[test]
+    fn a_noise_floor_is_not_mistaken_for_something_worth_hearing() {
+        // The complaint, in a test: white noise on the viewer's end. Every
+        // source has a noise floor, and an amplifier with enough range will
+        // find it and bring it up to speaking volume through any quiet
+        // passage.
+        let mut g = Gain::default();
+
+        // Deterministic hiss, well below anything worth listening to, for long
+        // enough that a climbing gain would have arrived by now.
+        let mut hiss: Vec<i16> = (0..48_000 * 6)
+            .map(|i| {
+                let n = ((i as u32).wrapping_mul(1_103_515_245).wrapping_add(12_345) >> 16) as i32;
+                ((n % 128) - 64) as i16
+            })
+            .collect();
+        g.apply(&mut hiss);
+
+        let loudest = peak(&hiss);
+        assert!(loudest < 0.05, "hiss should stay down, reached {loudest}");
     }
 
     #[test]
