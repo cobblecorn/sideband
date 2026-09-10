@@ -101,15 +101,28 @@ and 30 fps, low enough for almost any home link to carry from the first frame, a
 climbs to 1080p60 at 10 Mbit/s over the next ten to twenty seconds if the viewer
 keeps reporting a clean path. If they stop, it comes back down quickly.
 
-Bitrate and frame rate move continuously. The **picture size does not**. It is
-chosen once, about ten seconds in, from whatever the connection turned out to
-support, and then held for the rest of the session.
+Bitrate and frame rate move continuously. The **picture size barely moves at
+all**. It is chosen about ten seconds in, and after that it will improve if the
+connection genuinely improves, and fall back if it genuinely collapses, but
+nothing else will shift it.
 
 That asymmetry is deliberate. A bitrate change is invisible and a frame rate
 change nearly so, but a resolution change resizes the picture in the viewer's
-window, and chasing the connection with it means a window that grows and shrinks
-whenever the rate wanders across a threshold. A slightly soft picture is
-something you stop noticing after a minute. One that keeps resizing is not.
+window. A slightly soft picture is something you stop noticing after a minute;
+one that keeps resizing is not.
+
+So the size is not asked "where is the rate now", which is a question that
+changes every second by design. It is asked "what has every one of the last
+thirty seconds supported", and it may not answer twice inside a minute. A rate
+wandering across a threshold produces disagreement and nothing happens. Only a
+connection that has actually changed can make thirty consecutive seconds agree.
+
+It also asks whether anything went wrong before shrinking. A low rate does not
+mean a slow connection: the rate is capped by what the encoder actually spent,
+and a still window spends almost nothing, so a browser sitting on a page looks
+exactly like a struggling link. Shrinking needs the far end to have complained,
+by loss or by asking for less. On a healthy connection the picture stays full
+size however cheap the content is.
 
 The one decision is worth making, though: a full sized 1080p picture at half a
 megabit is about twelve thousandths of a bit per pixel, which never freezes and

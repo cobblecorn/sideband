@@ -225,17 +225,33 @@ fn divisor_for(bitrate: u32) -> u32 {
     }
 }
 
-/// Intervals spent measuring before the size is fixed.
+/// Intervals spent measuring before the size is first chosen.
 ///
 /// The session opens at full size, because the alternative is guessing before
 /// any evidence exists, and a guess that starts small on a fast link is a
-/// picture that is needlessly soft for as long as it lasts. Ten seconds is
-/// long enough for the rate to have found roughly where it belongs and short
-/// enough that the one change happens while a viewer is still settling in.
-///
-/// After this, the size never moves again for the life of the session. One
-/// change, early, and then nothing.
+/// picture that is needlessly soft for as long as it lasts.
 const SETTLE_INTERVALS: u32 = 10;
+
+/// How long every second in a row has to agree before the size moves again.
+///
+/// This is the whole mechanism, and it is not hysteresis. Hysteresis compares
+/// one number against two thresholds, which is fine when the number is steady
+/// and useless here, because the rate climbs and brakes every second by design
+/// and a link anywhere near a threshold crosses it constantly. That is what
+/// made the picture grow and shrink.
+///
+/// So the question asked is not "where is the rate now" but "what size has
+/// every one of the last thirty seconds supported". A rate wandering across a
+/// boundary answers that with a disagreement, and nothing moves. Only a link
+/// that has genuinely changed can make thirty consecutive seconds agree.
+const AGREE_INTERVALS: usize = 30;
+
+/// The least time between one size change and the next.
+///
+/// A backstop on top of the agreement window. Even if the connection really is
+/// swinging between two sustained states, the viewer sees at most one change a
+/// minute rather than a picture that keeps rearranging itself.
+const COOLDOWN_INTERVALS: u32 = 60;
 
 struct Rung {
     fps: u32,
@@ -535,10 +551,28 @@ pub struct Controller {
     /// and nothing measurable from here can answer it.
     ceiling: u32,
     /// The picture size in force, and how many intervals have been seen.
-    /// Once `SETTLE_INTERVALS` have passed the size is decided and neither
-    /// field is ever read again.
     divisor: u32,
     intervals: u32,
+    /// Intervals since the size last moved, so it cannot move again straight
+    /// away however convincing the evidence looks.
+    since_change: u32,
+    /// Intervals since the link last gave any sign of being the limit.
+    ///
+    /// The distinction this exists for: a low target rate does not mean a slow
+    /// connection. The rate is capped by what the encoder actually spent, and
+    /// a still window spends almost nothing, so a browser sitting on a page
+    /// looks exactly like a struggling link. Measured on a LAN that could
+    /// carry ten times as much, a static window settled at 2.5 Mbit/s and the
+    /// picture was shrunk for no reason at all.
+    ///
+    /// So shrinking asks a second question first: has anything actually gone
+    /// wrong. Loss, a receiver asking for less, a picture-loss request. On a
+    /// healthy connection the answer is no however cheap the content is, and
+    /// the picture is left alone.
+    strain: u32,
+    /// The recent target rates, oldest first. Bounded at `AGREE_INTERVALS`,
+    /// which is what makes "every second agreed" a question this can answer.
+    recent: std::collections::VecDeque<u32>,
     /// A size chosen by hand, which is obeyed from the first frame and never
     /// reconsidered. For anyone who would rather pick than be adapted to.
     fixed: Option<u32>,
@@ -563,6 +597,9 @@ impl Controller {
             ceiling: env_ceiling(),
             divisor: env_scale().unwrap_or(1),
             intervals: 0,
+            since_change: 0,
+            strain: u32::MAX,
+            recent: std::collections::VecDeque::with_capacity(AGREE_INTERVALS),
             fixed: env_scale(),
         }
     }
@@ -721,17 +758,86 @@ impl Controller {
 
         self.rung = next_rung(self.rung, self.bitrate);
 
-        // Decided once, on the interval the settling window ends, and never
-        // revisited. Not a ladder and not hysteresis: those both mean it can
-        // move again later, and it must not.
-        if self.fixed.is_none() {
-            self.intervals += 1;
-            if self.intervals == SETTLE_INTERVALS {
-                self.divisor = divisor_for(self.bitrate);
-            }
+        // Recorded before the size decision reads it. `trouble` is every
+        // reason the controller had to hold back this interval, which is
+        // exactly the evidence that the link, rather than the content, is
+        // what is setting the rate.
+        self.strain = if trouble { 0 } else { self.strain.saturating_add(1) };
+
+        self.settle_size();
+        self.target()
+    }
+
+    /// Moves the picture size, but only on evidence a wandering rate cannot
+    /// produce.
+    ///
+    /// The first decision comes at `SETTLE_INTERVALS`, from whatever the link
+    /// turned out to support. After that it can still improve, and still fall
+    /// back, but only when every second of the agreement window says the same
+    /// thing, and never twice inside the cooldown.
+    fn settle_size(&mut self) {
+        if self.fixed.is_some() {
+            return;
         }
 
-        self.target()
+        self.intervals += 1;
+        self.since_change += 1;
+
+        if self.recent.len() == AGREE_INTERVALS {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(self.bitrate);
+
+        // The opening decision, taken on whatever is known by then rather than
+        // waiting for a full window, because ten seconds of a picture at the
+        // wrong size is the thing being fixed.
+        if self.intervals == SETTLE_INTERVALS {
+            let wanted = divisor_for(self.bitrate);
+            if wanted <= self.divisor || self.strained() {
+                self.set_divisor(wanted);
+            }
+            return;
+        }
+        if self.intervals < SETTLE_INTERVALS || self.since_change < COOLDOWN_INTERVALS {
+            return;
+        }
+        if self.recent.len() < AGREE_INTERVALS {
+            return;
+        }
+
+        let worst = self.recent.iter().copied().min().unwrap_or(self.bitrate);
+        let best = self.recent.iter().copied().max().unwrap_or(self.bitrate);
+
+        // What the *worst* second of the window would support. If even that is
+        // a bigger picture than the one being sent, then every second in the
+        // window agreed, and the connection has genuinely improved.
+        let earned = divisor_for(worst);
+        if earned < self.divisor {
+            self.set_divisor(self.divisor / 2);
+            return;
+        }
+
+        // And the other way: if even the *best* second could not support the
+        // size currently being sent, nothing in the window agreed with it.
+        // Only when the link is what is holding the rate down, though, see
+        // `strain`: cheap content is not a reason to shrink anything.
+        if divisor_for(best) > self.divisor && self.strained() {
+            self.set_divisor(self.divisor * 2);
+        }
+    }
+
+    /// Whether the link has shown itself to be the limit recently enough to
+    /// justify sending a smaller picture.
+    fn strained(&self) -> bool {
+        self.strain < AGREE_INTERVALS as u32
+    }
+
+    fn set_divisor(&mut self, divisor: u32) {
+        let divisor = divisor.clamp(1, 4);
+        if divisor != self.divisor {
+            self.divisor = divisor;
+            self.since_change = 0;
+        }
     }
 
     /// How hard to push this second. Gentle at first and bolder the longer
@@ -1278,31 +1384,142 @@ mod tests {
     }
 
     #[test]
-    fn the_picture_size_never_changes_once_it_is_settled() {
-        // The complaint this exists for. Bitrate and frame rate chase the link
-        // all session; the size gets one decision and then holds it, because a
-        // viewer sees this one and does not see the others.
+    fn a_wandering_rate_never_moves_the_picture_size() {
+        // The complaint. The rate climbs and brakes every second by design, so
+        // a link near a threshold crosses it constantly, and every crossing
+        // used to resize the viewer's window.
         let mut c = Controller::new(START_BITRATE, 60);
-
-        // A link that settles slow.
         for _ in 0..SETTLE_INTERVALS {
-            c.update(&losing(0.0, 600_000));
             c.bitrate = 600_000;
+            // The far end is complaining, so the link really is the limit.
+            // Set directly because these tests drive the size decision on its
+            // own rather than through a whole interval.
+            c.strain = 0;
+            c.settle_size();
         }
-        let settled = c.target().divisor;
-        assert!(settled > 1, "a slow link should have shrunk, got {settled}");
+        let settled = c.divisor;
+        assert!(settled > 1, "a slow link should have shrunk");
 
-        // Now swing the rate all over the place for a long time. Nothing about
-        // the size may move again.
-        for i in 0..300 {
+        // Now swing it hard, for far longer than any window or cooldown.
+        for i in 0..600 {
             c.bitrate = if i % 2 == 0 { 400_000 } else { 9_000_000 };
-            c.update(&losing(0.0, c.bitrate));
-            assert_eq!(
-                c.target().divisor,
-                settled,
-                "the size moved at interval {i}, it must not"
-            );
+            c.settle_size();
+            assert_eq!(c.divisor, settled, "the size moved at interval {i}");
         }
+    }
+
+    #[test]
+    fn a_connection_that_really_improves_gets_a_better_picture() {
+        // What this is for. She was on a bad link, it got better, and the
+        // stream should notice rather than staying small out of caution.
+        let mut c = Controller::new(START_BITRATE, 60);
+        for _ in 0..SETTLE_INTERVALS {
+            c.bitrate = 600_000;
+            c.strain = 0;
+            c.settle_size();
+        }
+        assert_eq!(c.divisor, 4, "started poor");
+
+        // Sustained, every second of it, for the cooldown and the window.
+        for _ in 0..(COOLDOWN_INTERVALS as usize + AGREE_INTERVALS) {
+            c.bitrate = 2_000_000;
+            c.settle_size();
+        }
+        assert_eq!(c.divisor, 2, "should have improved one step");
+
+        for _ in 0..(COOLDOWN_INTERVALS as usize + AGREE_INTERVALS) {
+            c.bitrate = 6_000_000;
+            c.settle_size();
+        }
+        assert_eq!(c.divisor, 1, "and again, up to full size");
+    }
+
+    #[test]
+    fn improvement_is_one_step_at_a_time_and_never_rushed() {
+        // A link that leaps from terrible to excellent still climbs a step at
+        // a time, so the worst case is one resize per cooldown rather than a
+        // jump the moment things look good.
+        let mut c = Controller::new(START_BITRATE, 60);
+        for _ in 0..SETTLE_INTERVALS {
+            c.bitrate = 500_000;
+            c.strain = 0;
+            c.settle_size();
+        }
+        assert_eq!(c.divisor, 4);
+
+        // Excellent, but not yet for long enough.
+        for _ in 0..(COOLDOWN_INTERVALS as usize - 1) {
+            c.bitrate = 9_000_000;
+            c.settle_size();
+        }
+        assert_eq!(c.divisor, 4, "patience is the point");
+
+        for _ in 0..AGREE_INTERVALS {
+            c.bitrate = 9_000_000;
+            c.settle_size();
+        }
+        assert_eq!(c.divisor, 2, "one step, not straight to full size");
+    }
+
+    #[test]
+    fn a_link_that_collapses_falls_back() {
+        // The other direction still has to work, or a connection that gets
+        // worse leaves the viewer looking at mush for the rest of the call.
+        let mut c = Controller::new(START_BITRATE, 60);
+        for _ in 0..SETTLE_INTERVALS {
+            c.bitrate = 8_000_000;
+            c.settle_size();
+        }
+        assert_eq!(c.divisor, 1, "started well");
+
+        for _ in 0..(COOLDOWN_INTERVALS as usize + AGREE_INTERVALS) {
+            c.bitrate = 700_000;
+            c.strain = 0;
+            c.settle_size();
+        }
+        assert_eq!(c.divisor, 2);
+    }
+
+    #[test]
+    fn a_hand_picked_size_is_never_touched() {
+        let mut c = Controller::new(START_BITRATE, 60);
+        c.fixed = Some(2);
+        c.divisor = 2;
+        for i in 0..500 {
+            c.bitrate = if i % 3 == 0 { 400_000 } else { 9_000_000 };
+            c.settle_size();
+        }
+        assert_eq!(c.divisor, 2);
+    }
+
+    #[test]
+    fn cheap_content_on_a_healthy_link_is_never_shrunk() {
+        // Measured on a LAN that could carry ten times the rate: a static
+        // window is nearly free to encode, so the target settles low, and the
+        // first version of this read that as a slow connection and shrank a
+        // picture that had nothing wrong with it.
+        let mut c = Controller::new(START_BITRATE, 60);
+        for _ in 0..(SETTLE_INTERVALS as usize + COOLDOWN_INTERVALS as usize + AGREE_INTERVALS) {
+            // A low rate, and not one complaint from the far end.
+            c.bitrate = 900_000;
+            c.update(&losing(0.0, 120_000));
+            c.bitrate = 900_000;
+            c.settle_size();
+        }
+        assert_eq!(c.divisor, 1, "nothing went wrong, so nothing should have shrunk");
+    }
+
+    #[test]
+    fn a_link_that_is_actually_struggling_still_shrinks() {
+        // The counterpart. The same low rate, but with the far end reporting
+        // that it is the reason, is exactly the case worth shrinking for.
+        let mut c = Controller::new(START_BITRATE, 60);
+        for _ in 0..SETTLE_INTERVALS {
+            c.update(&losing(0.3, 900_000));
+            c.bitrate = 900_000;
+            c.settle_size();
+        }
+        assert!(c.divisor > 1, "a losing link should have shrunk, got {}", c.divisor);
     }
 
     #[test]
