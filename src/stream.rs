@@ -287,17 +287,26 @@ async fn admit_one(
 ) -> Result<net::Session<impl webrtc::peer_connection::PeerConnection + use<>>, String> {
     let webrtc = net::connect(net::ice_servers()).await?;
 
-    session.preparing("gathering network candidates");
+    // The read-out is only narrated while nobody is watching yet.
+    //
+    // Admitting the next person happens continuously in the background, and
+    // it must not describe itself: a session with somebody watching is Live,
+    // and saying "publishing to the relay" over the top of that takes the
+    // window out of Live and stops the read-out mid-stream, for an errand the
+    // person watching has no part in.
+    let narrate = watching == 0;
+
+    if narrate {
+        session.preparing("gathering network candidates");
+    }
     let offer = webrtc.offer().await?;
 
-    session.preparing("publishing to the relay");
+    if narrate {
+        session.preparing("publishing to the relay");
+    }
     put_offer(relay, ticket, offer).await?;
 
-    // The read-out only goes back to "waiting" when nobody is watching yet.
-    // With somebody already connected the session is live and stays live; a
-    // second person arriving must not make the window look like it dropped
-    // the first.
-    if watching == 0 {
+    if narrate {
         session.set_phase(Phase::Waiting {
             code: Some(ticket.code.clone()),
             link: link.to_owned(),
@@ -324,7 +333,7 @@ async fn admit_one(
         }
     }
 
-    if watching == 0 {
+    if narrate {
         session.preparing("connecting");
     }
     webrtc.accept_answer(&answer).await?;
