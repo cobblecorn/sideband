@@ -46,6 +46,20 @@ Run the script again after a rebuild to update the installed copy, or with
 `-Uninstall` to take it back off. No administrator rights, nothing written outside
 your own profile.
 
+**Sharing on your own network needs one firewall rule.** Windows blocks inbound
+connections to programs it has no rule for, and it does so silently: the server
+starts, the link looks perfectly normal, and the other device simply cannot reach
+it. What you see is a window waiting for a viewer that never arrives. Rules are
+per executable path, so one made while running from `target/release` says nothing
+about the installed copy. Run the installer from an administrator PowerShell and
+it adds the rule; run it as yourself and it prints the one line to run. Sharing by
+code through a relay needs none of this.
+
+**A minimised window cannot be captured.** Windows.Graphics.Capture delivers
+nothing at all while a window is minimised, so the viewer gets sound and no
+picture. Sideband says so rather than leaving you guessing, and starts sending the
+moment the window is restored.
+
 ## Use it
 
 Open Sideband, pick an application, press start. You get a link, and a six-character

@@ -147,7 +147,35 @@ async fn serve_local(pid: u32, port: u16, session: Arc<Session>) -> Result<(), S
         link: format!("http://{}:{port}/v/{secret}", local_address()),
     });
 
-    let answer = answer_rx.recv().await.ok_or("signalling closed")?;
+    // Waiting quietly for ever is the wrong thing to do here.
+    //
+    // Everything on this side can be perfectly healthy and the viewer still
+    // never arrive, because sharing on your own network means an *inbound*
+    // connection and Windows blocks those for programs it has no firewall rule
+    // for. It blocks them silently: the server is listening, the link is
+    // correct, and the other device simply cannot reach this one. The only
+    // symptom is this wait never ending, which looks like the program is
+    // broken rather than like a rule is missing.
+    //
+    // Worse, the rule is per executable path, so running the installed copy
+    // after having previously run one from a build directory loses it with no
+    // sign that anything changed.
+    let answer = {
+        let session = Arc::clone(&session);
+        let mut hint = tokio::time::interval(UNREACHED_HINT);
+        hint.tick().await; // fires immediately; the first tick is now
+        loop {
+            tokio::select! {
+                answer = answer_rx.recv() => break answer.ok_or("signalling closed")?,
+                _ = hint.tick() => {
+                    session.note(
+                        "nobody has reached this machine yet. If they are on your network,                          Windows Firewall may be blocking Sideband: run install.ps1 from an                          administrator PowerShell to add the rule."
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+    };
 
     if !approved(&answer, &session).await {
         return Err("you turned that viewer away".into());
@@ -162,6 +190,24 @@ async fn serve_local(pid: u32, port: u16, session: Arc<Session>) -> Result<(), S
     session.set_phase(Phase::Live);
     pump(&webrtc, keyframe, session).await
 }
+
+/// How long a capture that has never produced a frame is given before it is
+/// thrown away and opened again.
+///
+/// Long enough that a window which is merely slow to draw its first frame is
+/// not disturbed, short enough that restoring a minimised window feels like it
+/// worked rather than like it eventually recovered.
+const CAPTURE_RETRY_AFTER: Duration = Duration::from_secs(2);
+
+/// How long a live session may produce no video at all before saying so.
+const NO_VIDEO_HINT: Duration = Duration::from_secs(8);
+
+/// How long to wait for a viewer on the local network before suggesting the
+/// thing that is usually wrong.
+///
+/// Long enough not to nag someone who is still reading the link out, short
+/// enough to save an evening.
+const UNREACHED_HINT: Duration = Duration::from_secs(40);
 
 /// How long to give a viewer to actually connect after they answer. Past
 /// this the attempt is written off and a fresh offer goes up under the same
@@ -543,6 +589,8 @@ async fn pump<P: webrtc::peer_connection::PeerConnection>(
     // picture softens is the right way round.
     let packet_duration = Duration::from_millis(20);
     let mut sabotage = Sabotage::from_env();
+    let started = Instant::now();
+    let mut said_no_video = false;
     let mut ticker = tokio::time::interval(Duration::from_millis(200));
     let mut control = tokio::time::interval(CONTROL_INTERVAL);
     let mut was_paused = false;
@@ -592,6 +640,21 @@ async fn pump<P: webrtc::peer_connection::PeerConnection>(
                     break Ok(());
                 }
 
+                // A picture that never starts is not the same as one that
+                // stopped, and neither is visible from here without saying so.
+                // Window capture delivers nothing at all while its window is
+                // minimised, which is the ordinary explanation and not one
+                // anybody guesses while staring at a blank viewer.
+                if !said_no_video && session.counters().0 == 0 && started.elapsed() >= NO_VIDEO_HINT
+                {
+                    said_no_video = true;
+                    session.note(
+                        "no video yet. That window may be minimised: capture delivers \
+                         nothing while it is, so restore it or pick another application."
+                            .to_owned(),
+                    );
+                }
+
                 // A connection that has failed or closed will never carry
                 // another frame, and without this the loop would keep
                 // encoding into it while the window still said "live".
@@ -636,12 +699,17 @@ async fn pump<P: webrtc::peer_connection::PeerConnection>(
     drop(video_rx);
     drop(audio_rx);
 
-    let _ = video_thread.join();
-
-    // The audio thread's result is read, not discarded. It ending early is
-    // survivable, the stream keeps its picture, but it is the exact shape of
-    // "the viewer says they cannot hear anything" and it has to leave a trace
-    // somewhere rather than being thrown away here.
+    // Both results are read, not discarded.
+    //
+    // A worker thread that dies takes its half of the stream with it and says
+    // nothing, which is the worst shape a fault can have here: the session
+    // stays up, the counters for the other half keep climbing, and the only
+    // symptom is a viewer reporting that half of it is missing. That is
+    // exactly how a silent video failure was found, with audio flowing
+    // normally beside a picture that never started.
+    if let Ok(Err(e)) = video_thread.join() {
+        session.note(format!("video stopped: {e}"));
+    }
     if let Ok(Err(e)) = audio_thread.join() {
         session.note(format!("audio stopped: {e}"));
     }
@@ -683,11 +751,33 @@ fn video_loop(
         .map_err(|e| format!("CoInitializeEx failed: {e}"))?;
     }
 
-    // The first source has to work. A session that opens with nothing on
-    // screen is a failure to report, not a state to recover from, unlike
-    // every later source change, which is.
+    // The first source is opened by the same retry the loop uses for every
+    // later one, rather than being required to work first time.
+    //
+    // It used to be required, on the reasoning that a session opening with
+    // nothing on screen is a failure to report rather than a state to recover
+    // from. That reasoning had a hole in it: a *minimised* window cannot be
+    // captured at all, so opening one killed this thread outright, and the
+    // session carried on with audio flowing beside a picture that never
+    // arrived and nothing anywhere saying why. Restoring the window did not
+    // help, because there was no longer a thread to notice.
+    //
+    // Now it retries, says so once, and starts sending the moment the window
+    // is restored.
     let mut showing = session.selected_source();
-    let mut cap = Some(open_source(showing, &session)?);
+    let mut cap: Option<capture::WindowCapture> = None;
+    // Whether the current failure to open has already been reported. The
+    // retry below runs several times a second and must not narrate that.
+    let mut announced = false;
+    // Whether this capture has ever produced a frame, and when it was opened.
+    //
+    // These exist to tell two identical-looking situations apart. A capture
+    // that has delivered frames and then stops is an ordinary still window,
+    // and disturbing it would throw away a working session for nothing. A
+    // capture that has *never* delivered one is broken, and the only known
+    // cure is a fresh one.
+    let mut ever_framed = false;
+    let mut opened_at = Instant::now();
 
     let clock = pipeline::MediaClock::start();
     let mut pacer: pipeline::Pacer<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D> =
@@ -719,6 +809,9 @@ fn video_loop(
                     // first; replacing `cap` is what releases that device.
                     drop(enc.take());
                     cap = Some(next);
+                    announced = false;
+                    ever_framed = false;
+                    opened_at = Instant::now();
 
                     // Forcing a mismatch is what guarantees the encoder is
                     // rebuilt. Two applications can easily be the same size,
@@ -730,23 +823,51 @@ fn video_loop(
                     showing = wanted;
                 }
                 Err(e) => {
-                    // Only worth saying once, when it was actually asked for.
-                    // The retry below runs several times a second.
-                    if wanted != showing {
-                        session.note(e);
-                        if cap.is_some() {
-                            // There is still a working source to stay on, so
-                            // put the choice back, the picker showing an
-                            // application that is not on screen would be a lie.
-                            session.select_source(showing);
-                        } else {
-                            showing = wanted;
-                        }
+                    // Said once per failure, and said whether this was a
+                    // switch or the opening attempt. Staying quiet about the
+                    // opening one is what made a minimised window look like a
+                    // program that had simply stopped working.
+                    if !announced {
+                        session.note(format!(
+                            "{e}. A minimised window cannot be captured: restore it,                              or pick another application."
+                        ));
+                        announced = true;
+                    }
+                    if wanted != showing && cap.is_some() {
+                        // There is still a working source to stay on, so put
+                        // the choice back, the picker showing an application
+                        // that is not on screen would be a lie.
+                        session.select_source(showing);
+                    } else {
+                        showing = wanted;
                     }
                     std::thread::sleep(Duration::from_millis(200));
                     continue;
                 }
             }
+        }
+
+        // A capture that has never produced anything is reopened.
+        //
+        // Opening a capture over a minimised window *succeeds*. It returns a
+        // perfectly ordinary object whose session then produces nothing, ever,
+        // and it does not start producing when the window is restored either,
+        // because the session was wound up around a window that had no surface
+        // at the time. Nothing about it reports a fault: no error, no closed
+        // event, and the item keeps reporting the same size throughout, so
+        // even rebuilding the frame pool underneath it changes nothing.
+        //
+        // Measured: audio flowing normally beside a picture that never
+        // started, staying that way after the window was restored, with the
+        // only symptom a viewer looking at nothing. A fresh capture fixes it
+        // immediately, so that is what happens.
+        if cap.is_some() && !ever_framed && opened_at.elapsed() >= CAPTURE_RETRY_AFTER {
+            drop(enc.take());
+            cap = None;
+            dims = (0, 0);
+            pacer.reset();
+            opened_at = Instant::now();
+            continue;
         }
 
         let Some(source) = cap.as_ref() else { continue };
@@ -807,6 +928,10 @@ fn video_loop(
             }
             None => None,
         };
+
+        if fresh.is_some() {
+            ever_framed = true;
+        }
 
         // Rebuild on any geometry change. Dropping the old session first
         // matters: consumer cards cap concurrent NVENC sessions, so holding
