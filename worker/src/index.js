@@ -220,6 +220,17 @@ export default {
       return api(request, env, parts.slice(2));
     }
 
+    // Where to find a route, asked by the host at the start of a session.
+    //
+    // This exists so that nothing has to be configured on the machine doing
+    // the sharing. Set the TURN credentials once, here, as Worker secrets, and
+    // every machine that points at this relay picks them up: a new laptop, a
+    // reinstall, somebody else's computer. Sending a link stays the whole of
+    // what anybody has to do.
+    if (parts[0] === "api" && parts[1] === "ice") {
+      return json(await iceServers(env));
+    }
+
     if (request.method === "GET") {
       const pre = (parts[0] || "").toUpperCase();
       return html(page(CODE_RE.test(pre) ? pre : ""));
@@ -228,6 +239,48 @@ export default {
     return json({ error: "not found" }, 404);
   },
 };
+
+/// STUN always, and TURN as well when this relay has been given credentials.
+///
+/// TURN matters for the viewers hole punching cannot reach: anybody on mobile
+/// data, where the carrier puts every subscriber behind one shared address and
+/// there is nothing on the far side to punch through, and anybody on a network
+/// that keeps its own devices apart.
+///
+/// Credentials are minted per session and last a day, so nothing long lived is
+/// handed out and nothing long lived is stored anywhere but here.
+async function iceServers(env) {
+  const stun = {
+    urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"],
+  };
+
+  if (!env.TURN_KEY_ID || !env.TURN_TOKEN) {
+    return { iceServers: [stun], turn: false };
+  }
+
+  try {
+    const res = await fetch(
+      `https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/generate-ice-servers`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${env.TURN_TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ ttl: 86400 }),
+      },
+    );
+    if (!res.ok) return { iceServers: [stun], turn: false };
+
+    const body = await res.json();
+    const got = Array.isArray(body.iceServers) ? body.iceServers : [body.iceServers];
+    return { iceServers: [stun, ...got.filter(Boolean)], turn: true };
+  } catch (_) {
+    // A relay that cannot mint credentials is still a working relay for
+    // everybody who did not need them.
+    return { iceServers: [stun], turn: false };
+  }
+}
 
 async function api(request, env, rest) {
   // Create.

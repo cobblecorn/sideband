@@ -238,7 +238,41 @@ product with its own 1,000 GB/month allowance, and at roughly 4.5 GB/hour it cov
 about 220 hours of relayed streaming in the worst case where every session relays.
 Most home-to-home connections go direct and use none of it.
 
-TURN is optional and configured through the environment:
+### Viewers your connection cannot reach directly
+
+Most connections find each other on their own. Two that cannot need a relay of
+last resort, and there is exactly one situation where this is not optional: a
+viewer on mobile data. Carriers put every subscriber behind one shared address,
+so there is nothing on the far side to punch a hole in, and no amount of
+retrying will help. The same applies to a network that keeps its own devices
+apart, which some routers do by default for anything on wireless.
+
+**Set it on the relay, not on the machine sharing.** The relay is the piece of
+the setup that is already shared, so configuring it there means every machine
+pointed at it is configured too: a new laptop, a reinstall, somebody else
+running it. Sending a link stays the whole of what anybody has to do, and
+nothing has to be adjusted on the viewer's side ever.
+
+Create a TURN key in the Cloudflare dashboard, under Realtime, then:
+
+```bash
+cd worker
+npx wrangler secret put TURN_KEY_ID
+npx wrangler secret put TURN_TOKEN
+npx wrangler deploy
+```
+
+The host asks the relay for its route options at the start of every session and
+says so in the read-out when there are none. Credentials are minted per session
+and last a day, so nothing long lived is handed out or stored on any machine
+doing the sharing.
+
+Only connections that cannot go direct use it, and it carries the video rather
+than just introducing the two ends, so it is the one part of this with a real
+bandwidth cost: roughly 4.5 GB an hour against Cloudflare's 1,000 GB a month.
+
+TURN can also be set per machine through the environment, which the relay
+overrides when it has something to say:
 
 ```bash
 export SIDEBAND_CF_TURN_KEY_ID=...      # Cloudflare Realtime

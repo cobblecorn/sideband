@@ -28,7 +28,7 @@ use rtc::peer_connection::configuration::media_engine::{
 };
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::sdp::RTCSessionDescription;
-use rtc::peer_connection::transport::RTCIceServer;
+pub use rtc::peer_connection::transport::RTCIceServer;
 use rtc::rtp_transceiver::rtp_sender::*;
 use rtc::rtp_transceiver::PayloadType;
 use tokio::sync::Notify;
@@ -201,6 +201,54 @@ pub fn have_turn() -> bool {
     let cloudflare = std::env::var("SIDEBAND_CF_TURN_KEY_ID").is_ok()
         && std::env::var("SIDEBAND_CF_TURN_TOKEN").is_ok();
     explicit || cloudflare
+}
+
+/// What the relay says the route options are, if it says anything.
+///
+/// Asked before falling back to what this machine happens to have configured,
+/// because the relay is the one piece of the setup that is already shared:
+/// configure it once there and every machine pointed at it is configured too.
+/// A new laptop, a reinstall, a friend running it, all of them just work.
+///
+/// Failure is not an error. A relay that has nothing to say leaves this
+/// exactly where it was.
+pub fn ice_from_relay(relay: &str) -> Option<(Vec<RTCIceServer>, bool)> {
+    let url = format!("{}/api/ice", relay.trim_end_matches('/'));
+    let body: serde_json::Value = ureq::get(&url).call().ok()?.body_mut().read_json().ok()?;
+
+    let listed = body.get("iceServers")?.as_array()?;
+    let mut servers = Vec::new();
+    for entry in listed {
+        let urls = match entry.get("urls") {
+            Some(serde_json::Value::Array(a)) => {
+                a.iter().filter_map(|u| u.as_str().map(str::to_owned)).collect()
+            }
+            Some(serde_json::Value::String(u)) => vec![u.clone()],
+            _ => continue,
+        };
+        if urls.is_empty() {
+            continue;
+        }
+        servers.push(RTCIceServer {
+            urls,
+            username: entry
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+            credential: entry
+                .get("credential")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+        });
+    }
+
+    if servers.is_empty() {
+        return None;
+    }
+    let turn = body.get("turn").and_then(|v| v.as_bool()).unwrap_or(false);
+    Some((servers, turn))
 }
 
 pub fn ice_servers() -> Vec<RTCIceServer> {

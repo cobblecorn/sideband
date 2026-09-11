@@ -255,27 +255,6 @@ async fn serve_relay(pid: u32, relay: String, session: Arc<Session>) -> Result<(
 
     session.preparing("starting up");
 
-    // Said once, at the start, because its absence is invisible until a
-    // particular kind of viewer cannot connect and nothing explains why.
-    //
-    // Without a relay of last resort, two ends that cannot see each other
-    // directly have no route at all. Home to home usually manages it. A phone
-    // on mobile data usually cannot: carriers put everybody behind one shared
-    // address, and there is nothing on the other side to punch a hole in.
-    if !net::have_turn() {
-        // Printed as well as noted: this is emitted before the session goes
-        // live, and the terminal read-out only shows notices once it is.
-        eprintln!(
-            "  note: no TURN relay configured. Viewers on mobile data, or on a network that keeps its devices apart, will not connect."
-        );
-        session.note(
-            "no TURN relay configured, so viewers on mobile data, or on a network \
-             that keeps its devices apart, will not be able to connect. Most home \
-             connections do not need one."
-                .to_owned(),
-        );
-    }
-
     // The relay issues the code and a secret token. The host cannot choose its
     // own code, that would let one be squatted, and would leave the relay
     // nothing to attach a per-client limit to.
@@ -301,12 +280,13 @@ async fn admit_one(
     link: &str,
     session: &Arc<Session>,
     watching: usize,
+    ice: &[net::RTCIceServer],
 //
 // `use<>` captures nothing: without it the returned connection borrows every
 // argument for its whole life, which makes it unable to leave the task that
 // built it, and admitting viewers happens on a task of its own.
 ) -> Result<net::Session<impl webrtc::peer_connection::PeerConnection + use<>>, String> {
-    let webrtc = net::connect(net::ice_servers()).await?;
+    let webrtc = net::connect(ice.to_vec()).await?;
 
     // The read-out is only narrated while nobody is watching yet.
     //
@@ -386,6 +366,25 @@ async fn relay_attempts(
     link: &str,
     session: Arc<Session>,
 ) -> Result<(), String> {
+    // Asked of the relay once, and shared by every viewer admitted after.
+    //
+    // The relay is the piece of the setup that is already shared, so putting
+    // the TURN credentials there means no machine running this needs any
+    // configuration of its own. Anything the relay cannot tell us falls back
+    // to whatever is set locally, and then to STUN alone.
+    let (ice, have_turn) = match net::ice_from_relay(relay) {
+        Some(found) => found,
+        None => (net::ice_servers(), net::have_turn()),
+    };
+
+    if !have_turn {
+        let warning = "no TURN relay configured, so viewers on mobile data, or on a \
+             network that keeps its devices apart, will not be able to connect. \
+             Most home connections do not need one.";
+        eprintln!("  note: {warning}");
+        session.note(warning.to_owned());
+    }
+
     let mut watching: tokio::task::JoinSet<Result<(), String>> = tokio::task::JoinSet::new();
     let mut failures = 0usize;
 
@@ -412,7 +411,7 @@ async fn relay_attempts(
                 }
             }
 
-            admitted = admit_one(relay, ticket, link, &session, already_watching) => {
+            admitted = admit_one(relay, ticket, link, &session, already_watching, &ice) => {
                 match admitted {
                     Ok(viewer) => {
                         failures = 0;
