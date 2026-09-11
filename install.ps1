@@ -129,16 +129,27 @@ if (& $has_rule) {
     "  the firewall on your home network. Without it, laptops and phones on"
     "  the same network as this machine cannot connect."
     ""
+    # Sent encoded, not as text. A command handed to a second PowerShell as
+    # plain arguments is split on spaces and has its quoting reinterpreted,
+    # and a rule whose program path was mangled on the way fails in a window
+    # nobody sees. Any error is written somewhere this installer can read it
+    # back, so a failure is reported as what it was rather than guessed at.
+    $log = Join-Path $env:TEMP "sideband-firewall.txt"
+    Remove-Item $log -ErrorAction SilentlyContinue
+    $elevated = "try { $add_rule } catch { `$_ | Out-File -Encoding utf8 '$log' }"
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($elevated))
     try {
         Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden `
-            -ArgumentList "-NoProfile", "-Command", $add_rule
+            -ArgumentList "-NoProfile", "-EncodedCommand", $encoded
     } catch {
         # Declining the prompt lands here.
     }
     if (& $has_rule) {
         $firewall = "allowed on your home network"
+    } elseif (Test-Path $log) {
+        $firewall = "NOT allowed: " + (Get-Content $log -Raw).Trim()
     } else {
-        $firewall = "NOT allowed: the Windows prompt was declined"
+        $firewall = "NOT allowed: the Windows prompt was declined or did not appear"
     }
 }
 
