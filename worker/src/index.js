@@ -569,12 +569,25 @@ async function attempt(code, onStatus) {
   if (!res.ok) throw new Error('Could not reach the server.');
   const offer = await res.text();
 
-  const pc = new RTCPeerConnection({
-    iceServers: [
-      { urls: 'stun:stun.cloudflare.com:3478' },
-      { urls: 'stun:stun.l.google.com:19302' },
-    ],
-  });
+  // The same route options the host was given, from the same place, so a
+  // relay of last resort set up once on this Worker helps both ends. Without
+  // this the viewer would only ever try STUN, and a phone on mobile data, which
+  // is exactly who a relay is for, would be the one end not using it.
+  let iceServers = [
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    { urls: 'stun:stun.l.google.com:19302' },
+  ];
+  try {
+    const ice = await fetch('/api/ice', { cache: 'no-store' });
+    if (ice.ok) {
+      const body = await ice.json();
+      if (Array.isArray(body.iceServers) && body.iceServers.length) iceServers = body.iceServers;
+    }
+  } catch (_) {
+    // STUN alone is still a working default for most connections.
+  }
+
+  const pc = new RTCPeerConnection({ iceServers });
   window.pc = pc;
 
   // Attached before setRemoteDescription: a track can arrive the moment the
