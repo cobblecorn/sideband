@@ -190,6 +190,19 @@ pub struct Session<P: PeerConnection> {
 ///
 /// Blocking, because fetching Cloudflare credentials is an HTTP call. Call it
 /// before the runtime starts carrying media.
+/// Whether a relay of last resort is configured.
+///
+/// Worth being able to ask, because its absence is invisible until a specific
+/// kind of viewer cannot connect and nothing says why.
+pub fn have_turn() -> bool {
+    let explicit = std::env::var("SIDEBAND_TURN_URL").is_ok()
+        && std::env::var("SIDEBAND_TURN_USER").is_ok()
+        && std::env::var("SIDEBAND_TURN_PASS").is_ok();
+    let cloudflare = std::env::var("SIDEBAND_CF_TURN_KEY_ID").is_ok()
+        && std::env::var("SIDEBAND_CF_TURN_TOKEN").is_ok();
+    explicit || cloudflare
+}
+
 pub fn ice_servers() -> Vec<RTCIceServer> {
     let mut servers = vec![RTCIceServer {
         urls: vec![

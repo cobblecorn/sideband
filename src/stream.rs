@@ -255,6 +255,27 @@ async fn serve_relay(pid: u32, relay: String, session: Arc<Session>) -> Result<(
 
     session.preparing("starting up");
 
+    // Said once, at the start, because its absence is invisible until a
+    // particular kind of viewer cannot connect and nothing explains why.
+    //
+    // Without a relay of last resort, two ends that cannot see each other
+    // directly have no route at all. Home to home usually manages it. A phone
+    // on mobile data usually cannot: carriers put everybody behind one shared
+    // address, and there is nothing on the other side to punch a hole in.
+    if !net::have_turn() {
+        // Printed as well as noted: this is emitted before the session goes
+        // live, and the terminal read-out only shows notices once it is.
+        eprintln!(
+            "  note: no TURN relay configured. Viewers on mobile data, or on a network that keeps its devices apart, will not connect."
+        );
+        session.note(
+            "no TURN relay configured, so viewers on mobile data, or on a network \
+             that keeps its devices apart, will not be able to connect. Most home \
+             connections do not need one."
+                .to_owned(),
+        );
+    }
+
     // The relay issues the code and a secret token. The host cannot choose its
     // own code, that would let one be squatted, and would leave the relay
     // nothing to attach a per-client limit to.
@@ -342,7 +363,15 @@ async fn admit_one(
         Ok(()) => Ok(webrtc),
         Err(_) => {
             webrtc.close().await;
-            Err("that viewer answered but never connected".into())
+            let routes = viewer_routes(&answer);
+            Err(format!(
+                "that viewer answered but never connected. They offered {routes}{}",
+                if net::have_turn() {
+                    "."
+                } else {
+                    ", and there is no TURN relay configured to fall back on."
+                }
+            ))
         }
     }
 }
@@ -582,6 +611,34 @@ async fn approved(answer: &str, session: &Arc<Session>) -> Decision {
 /// The server-reflexive candidate is their address as the world sees it, which
 /// is the one worth showing: it is what tells the host whether this is the
 /// person they just sent a code to or someone else entirely.
+/// The kinds of route a viewer offered, most useful first.
+///
+/// `srflx` means they found themselves through STUN and a direct route is at
+/// least possible. Only `host` means STUN told them nothing, and `relay` means
+/// they are prepared to go the long way round. A viewer offering neither srflx
+/// nor relay is one that will only ever connect on the same network.
+fn viewer_routes(answer: &str) -> String {
+    let mut host = 0;
+    let mut srflx = 0;
+    let mut relay = 0;
+
+    for line in answer.lines() {
+        let Some(rest) = line.strip_prefix("a=candidate:") else { continue };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        if fields.len() < 8 {
+            continue;
+        }
+        match fields[7] {
+            "host" => host += 1,
+            "srflx" => srflx += 1,
+            "relay" => relay += 1,
+            _ => {}
+        }
+    }
+
+    format!("{host} local, {srflx} through STUN, {relay} relayed")
+}
+
 fn describe_viewer(answer: &str) -> String {
     let mut host_candidate = None;
 
