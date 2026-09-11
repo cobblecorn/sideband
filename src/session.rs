@@ -5,8 +5,9 @@
 //! how to draw them. That is what lets the same engine back both the GUI and
 //! the command line without either one owning the other.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,6 +30,34 @@ pub enum Phase {
 /// it never becomes part of the furniture.
 const NOTICE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(6);
 
+/// Somebody watching, as the window lists them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewerInfo {
+    /// Ours, for this session only. What removing them refers to.
+    pub id: u64,
+    /// How their page described itself, "Android, Chrome" and the like. Empty
+    /// when it said nothing.
+    pub device: String,
+    /// Their address as the world sees it, when they shared one.
+    pub address: String,
+    /// The random name their browser keeps for itself. Not shown: it exists
+    /// so that somebody removed is recognised if they come straight back.
+    pub browser: String,
+    pub since: Instant,
+}
+
+impl ViewerInfo {
+    /// One line for the window and the read-out.
+    pub fn describe(&self) -> String {
+        match (self.device.is_empty(), self.address.is_empty()) {
+            (false, false) => format!("{} ({})", self.device, self.address),
+            (false, true) => self.device.clone(),
+            (true, false) => self.address.clone(),
+            (true, true) => "someone".to_owned(),
+        }
+    }
+}
+
 pub struct Session {
     phase: Mutex<Phase>,
 
@@ -41,8 +70,30 @@ pub struct Session {
     /// meant stopping and starting again to see the code.
     share: Mutex<Option<(Option<String>, String)>>,
 
-    /// How many people are watching right now, for the read-out.
-    watching: AtomicU32,
+    /// Who is watching right now, in the order they arrived.
+    viewers: Mutex<Vec<ViewerInfo>>,
+
+    /// Viewers the host has asked to remove, by `ViewerInfo::id`. Each one's
+    /// send loop looks for itself here and ends.
+    kicked: Mutex<HashSet<u64>>,
+
+    /// Browsers turned away for the rest of this session, by the name their
+    /// page keeps. Without this, removing somebody from a link that admits
+    /// everybody would only last until their page reconnected, a few seconds.
+    banned: Mutex<HashSet<String>>,
+
+    /// Nobody new gets in while this is set. Everyone already watching stays.
+    locked: AtomicBool,
+
+    /// Asked for a fresh code and link, the old ones stopped. Set by the
+    /// window and taken by the relay loop, which is the only thing that can
+    /// act on it.
+    new_link: AtomicBool,
+
+    /// Play a sound when somebody arrives or leaves, and when a hotkey flips
+    /// something. The window is usually behind a fullscreen game when either
+    /// happens, so a sound is the only notice that reaches anyone.
+    sounds: AtomicBool,
     source: Mutex<(String, String)>,
     resolution: Mutex<String>,
 
@@ -58,6 +109,14 @@ pub struct Session {
     /// said. Short-lived by design, a switch that could not be made needs an
     /// explanation at the moment it fails, not a permanent banner.
     notice: Mutex<Option<(String, Instant)>>,
+
+    /// Whether the current notice is news rather than a problem, somebody
+    /// arriving rather than something failing, so it can be drawn as such.
+    notice_is_news: AtomicBool,
+
+    /// Whether viewers who cannot reach this machine on their own can still
+    /// get in, and why: see `portmap`. `None` until a session has looked.
+    reach: Mutex<Option<(bool, String)>>,
 
     pub stop: AtomicBool,
 
@@ -81,12 +140,19 @@ pub struct Session {
     /// it is off until asked for.
     auto_approve: AtomicBool,
 
-    /// Held mid-session: the connection stays up and the viewer keeps the
-    /// last frame on screen, rather than being disconnected and having to
-    /// rejoin with a new code.
-    paused: AtomicBool,
+    /// The picture is covered by a pause card, see `stream::HideCard`.
+    ///
+    /// Covered rather than frozen. Freezing held the last frame on the
+    /// viewer's screen, which is exactly the frame with the login box or the
+    /// private message in it that prompted somebody to reach for this. And
+    /// the stream keeps flowing underneath, so there is nothing to recover
+    /// from when it comes back: no dropped references, no keyframe needed.
+    hidden: AtomicBool,
 
-    mic_on: AtomicBool,
+    /// Shared with every microphone opened for this session, one per viewer,
+    /// so that the button, the hotkey and all of them agree. It used to live
+    /// inside the microphone, where the button could not reach it at all.
+    mic_on: Arc<AtomicBool>,
     mic_available: AtomicBool,
     /// Peak since the last read, as a fraction of full scale times 1000.
     mic_peak: AtomicU32,
@@ -121,19 +187,26 @@ impl Default for Session {
         Self {
             phase: Mutex::new(Phase::Idle),
             share: Mutex::new(None),
-            watching: AtomicU32::new(0),
+            viewers: Mutex::new(Vec::new()),
+            kicked: Mutex::new(HashSet::new()),
+            banned: Mutex::new(HashSet::new()),
+            locked: AtomicBool::new(false),
+            new_link: AtomicBool::new(false),
+            sounds: AtomicBool::new(true),
             source: Mutex::new((String::new(), String::new())),
             resolution: Mutex::new(String::new()),
             selected: AtomicU32::new(0),
             notice: Mutex::new(None),
+            notice_is_news: AtomicBool::new(false),
+            reach: Mutex::new(None),
             stop: AtomicBool::new(false),
             video_frames: AtomicU64::new(0),
             audio_packets: AtomicU64::new(0),
             video_bytes: AtomicU64::new(0),
             approval: Mutex::new(None),
             auto_approve: AtomicBool::new(false),
-            paused: AtomicBool::new(false),
-            mic_on: AtomicBool::new(false),
+            hidden: AtomicBool::new(false),
+            mic_on: Arc::new(AtomicBool::new(false)),
             mic_available: AtomicBool::new(false),
             mic_peak: AtomicU32::new(0),
             mic_name: Mutex::new(String::new()),
@@ -167,12 +240,106 @@ impl Session {
         self.share.lock().ok().and_then(|s| s.clone())
     }
 
-    pub fn watching(&self) -> u32 {
-        self.watching.load(Ordering::Relaxed)
+    /// Replaces the code and link on offer without changing the phase, for
+    /// when they change while somebody is watching.
+    pub fn set_share(&self, code: Option<String>, link: String) {
+        if let Ok(mut s) = self.share.lock() {
+            *s = Some((code, link));
+        }
     }
 
-    pub fn set_watching(&self, n: u32) {
-        self.watching.store(n, Ordering::Relaxed);
+    pub fn watching(&self) -> u32 {
+        self.viewers.lock().map_or(0, |v| v.len() as u32)
+    }
+
+    pub fn viewers(&self) -> Vec<ViewerInfo> {
+        self.viewers.lock().map(|v| v.clone()).unwrap_or_default()
+    }
+
+    pub fn add_viewer(&self, viewer: ViewerInfo) {
+        if let Ok(mut v) = self.viewers.lock() {
+            v.push(viewer);
+        }
+    }
+
+    /// Takes them off the list, and returns who they were.
+    pub fn remove_viewer(&self, id: u64) -> Option<ViewerInfo> {
+        if let Ok(mut k) = self.kicked.lock() {
+            k.remove(&id);
+        }
+        let mut v = self.viewers.lock().ok()?;
+        let at = v.iter().position(|x| x.id == id)?;
+        Some(v.remove(at))
+    }
+
+    /// Removes somebody, and keeps them out for the rest of the session.
+    ///
+    /// Kept out by the name their browser keeps, and by their address when it
+    /// kept none. Not by address otherwise: everybody in one house shares one,
+    /// and removing a stranger should not also remove the person on the sofa.
+    pub fn kick(&self, id: u64) {
+        let Some(who) = self.viewers().into_iter().find(|v| v.id == id) else { return };
+        if let Ok(mut k) = self.kicked.lock() {
+            k.insert(id);
+        }
+        self.ban(&who.browser, &who.address);
+    }
+
+    /// Keeps somebody out for the rest of the session without their having
+    /// got in, for a viewer the host turned away at the prompt.
+    pub fn ban(&self, browser: &str, address: &str) {
+        let key = if !browser.is_empty() {
+            browser
+        } else if !address.is_empty() {
+            address
+        } else {
+            return;
+        };
+        if let Ok(mut b) = self.banned.lock() {
+            b.insert(key.to_owned());
+        }
+    }
+
+    pub fn is_kicked(&self, id: u64) -> bool {
+        self.kicked.lock().is_ok_and(|k| k.contains(&id))
+    }
+
+    /// Whether somebody asking to watch was removed earlier this session.
+    pub fn is_banned(&self, browser: &str, address: &str) -> bool {
+        let Ok(b) = self.banned.lock() else { return false };
+        (!browser.is_empty() && b.contains(browser))
+            || (browser.is_empty() && !address.is_empty() && b.contains(address))
+    }
+
+    pub fn locked(&self) -> bool {
+        self.locked.load(Ordering::Relaxed)
+    }
+
+    pub fn set_locked(&self, on: bool) {
+        self.locked.store(on, Ordering::Relaxed);
+    }
+
+    pub fn request_new_link(&self) {
+        self.new_link.store(true, Ordering::Relaxed);
+    }
+
+    /// Looked at without being taken, by the parts that only need to get out
+    /// of the way of it.
+    pub fn new_link_pending(&self) -> bool {
+        self.new_link.load(Ordering::Relaxed)
+    }
+
+    /// Read and cleared together, so one press is acted on once.
+    pub fn take_new_link(&self) -> bool {
+        self.new_link.swap(false, Ordering::Relaxed)
+    }
+
+    pub fn sounds(&self) -> bool {
+        self.sounds.load(Ordering::Relaxed)
+    }
+
+    pub fn set_sounds(&self, on: bool) {
+        self.sounds.store(on, Ordering::Relaxed);
     }
 
     pub fn preparing(&self, what: &str) {
@@ -211,10 +378,35 @@ impl Session {
         self.selected.load(Ordering::Relaxed)
     }
 
+    /// Something that went wrong, or that needs doing.
     pub fn note(&self, what: impl Into<String>) {
         if let Ok(mut n) = self.notice.lock() {
             *n = Some((what.into(), Instant::now()));
+            self.notice_is_news.store(false, Ordering::Relaxed);
         }
+    }
+
+    /// Something that happened and is fine, somebody joining or leaving.
+    pub fn tell(&self, what: impl Into<String>) {
+        if let Ok(mut n) = self.notice.lock() {
+            *n = Some((what.into(), Instant::now()));
+            self.notice_is_news.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether the notice showing now came from `tell` rather than `note`.
+    pub fn notice_is_news(&self) -> bool {
+        self.notice_is_news.load(Ordering::Relaxed)
+    }
+
+    pub fn set_reach(&self, ok: bool, why: impl Into<String>) {
+        if let Ok(mut r) = self.reach.lock() {
+            *r = Some((ok, why.into()));
+        }
+    }
+
+    pub fn reach(&self) -> Option<(bool, String)> {
+        self.reach.lock().ok().and_then(|r| r.clone())
     }
 
     /// The current notice, if one was left recently enough to still matter.
@@ -288,15 +480,13 @@ impl Session {
         self.approval.lock().ok().and_then(|a| *a)
     }
 
-    pub fn paused(&self) -> bool {
-        self.paused.load(Ordering::Relaxed)
+    pub fn hidden(&self) -> bool {
+        self.hidden.load(Ordering::Relaxed)
     }
 
     /// Returns the new state.
-    pub fn toggle_pause(&self) -> bool {
-        let now = !self.paused.load(Ordering::Relaxed);
-        self.paused.store(now, Ordering::Relaxed);
-        now
+    pub fn toggle_hidden(&self) -> bool {
+        !self.hidden.fetch_xor(true, Ordering::Relaxed)
     }
 
     pub fn mic_available(&self) -> bool {
@@ -313,6 +503,11 @@ impl Session {
 
     pub fn set_mic_on(&self, on: bool) {
         self.mic_on.store(on, Ordering::Relaxed);
+    }
+
+    /// The switch itself, for a microphone to read directly.
+    pub fn mic_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.mic_on)
     }
 
     /// Peak level 0.0-1.0. Reading does not clear it; the capture side owns
@@ -600,13 +795,80 @@ mod tests {
     }
 
     #[test]
-    fn pause_toggles_and_reports_the_new_state() {
+    fn hiding_toggles_and_reports_the_new_state() {
         let s = Session::default();
-        assert!(!s.paused());
-        assert!(s.toggle_pause(), "toggling from off returns on");
-        assert!(s.paused());
-        assert!(!s.toggle_pause());
-        assert!(!s.paused());
+        assert!(!s.hidden());
+        assert!(s.toggle_hidden(), "toggling from off returns on");
+        assert!(s.hidden());
+        assert!(!s.toggle_hidden());
+        assert!(!s.hidden());
+    }
+
+    #[test]
+    fn the_mic_button_and_every_microphone_share_one_switch() {
+        // The bug this guards: the window's button flipped a flag nothing
+        // read, and only the hotkey reached the microphone itself.
+        let s = Session::default();
+        let a = s.mic_flag();
+        let b = s.mic_flag();
+        s.set_mic_on(true);
+        assert!(a.load(Ordering::Relaxed) && b.load(Ordering::Relaxed));
+        b.store(false, Ordering::Relaxed);
+        assert!(!s.mic_on(), "a change from either side is seen by the other");
+    }
+
+    fn viewer(id: u64, browser: &str, address: &str) -> ViewerInfo {
+        ViewerInfo {
+            id,
+            device: "Android, Chrome".into(),
+            address: address.into(),
+            browser: browser.into(),
+            since: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn viewers_are_counted_as_they_come_and_go() {
+        let s = Session::default();
+        assert_eq!(s.watching(), 0);
+        s.add_viewer(viewer(1, "a", "203.0.113.9"));
+        s.add_viewer(viewer(2, "b", "203.0.113.9"));
+        assert_eq!(s.watching(), 2);
+        assert_eq!(s.remove_viewer(1).map(|v| v.id), Some(1));
+        assert_eq!(s.watching(), 1);
+        assert_eq!(s.remove_viewer(1), None, "nobody is removed twice");
+    }
+
+    #[test]
+    fn removing_somebody_keeps_their_browser_out_but_not_their_house() {
+        let s = Session::default();
+        s.add_viewer(viewer(7, "stranger", "203.0.113.9"));
+        s.kick(7);
+        assert!(s.is_kicked(7));
+        assert!(s.is_banned("stranger", "198.51.100.1"), "the same browser, anywhere");
+        assert!(
+            !s.is_banned("sofa", "203.0.113.9"),
+            "somebody else behind the same address is not caught by it"
+        );
+    }
+
+    #[test]
+    fn a_browser_that_keeps_no_name_is_kept_out_by_address() {
+        let s = Session::default();
+        s.add_viewer(viewer(3, "", "203.0.113.9"));
+        s.kick(3);
+        assert!(s.is_banned("", "203.0.113.9"));
+    }
+
+    #[test]
+    fn a_new_link_is_acted_on_once() {
+        let s = Session::default();
+        assert!(!s.take_new_link());
+        s.request_new_link();
+        assert!(s.new_link_pending());
+        assert!(s.take_new_link());
+        assert!(!s.take_new_link());
+        assert!(!s.new_link_pending());
     }
 
     #[test]

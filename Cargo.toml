@@ -7,8 +7,10 @@ edition = "2024"
 async-trait = "0.1.92"
 bytes = "1.12.1"
 eframe = { version = "0.36.1", default-features = false, features = ["glow", "default_fonts"] }
+igd-next = "0.17.1"
 log = "0.4"
 moq-nvenc = "0.0.3"
+qrcode = { version = "0.14.1", default-features = false }
 rand = "0.10.2"
 rtc = "0.20.4"
 rusty-opus = "0.9.1"

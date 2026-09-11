@@ -35,8 +35,21 @@
 //   GET    /api/session/:code/offer      viewer fetches  (unclaimed only)
 //   POST   /api/session/:code/answer     viewer claims
 //   GET    /api/session/:code/answer      host collects   (token)
+//   PUT    /api/session/:code/lock       host stops new viewers, "1" or "0" (token)
 //   DELETE /api/session/:code            host purges     (token)
 //   GET    /:code                        viewer page, code pre-filled
+//
+//   PUT    /api/room/:room               host says which code is live (room key)
+//   GET    /api/room/:room               viewer asks whether anything is live
+//   DELETE /api/room/:room/live          host finished sharing (room key)
+//   DELETE /api/room/:room               host retires the link (room key)
+//   GET    /r/:room                      viewer page for a permanent link
+//
+// A room is a link that does not change between sessions. The code is still
+// what admits a viewer; the room only says which code is current, so a
+// bookmarked link finds tonight's session without anybody sending a new one.
+// Its name is the secret a viewer holds, twelve characters nobody can guess,
+// and the key that updates it is held only by the host that first used it.
 
 /// Long enough to read a code out over a call, short enough that a leaked one
 /// is dead before it is useful.
@@ -58,11 +71,25 @@ const CODE_RE = /^[A-Z2-9]{6}$/;
 /// An SDP with a full candidate set is a few kilobytes.
 const MAX_SDP = 64 * 1024;
 
+/// Room names: the code alphabet in lower case, twelve long. 31^12 is about
+/// 7.9e17, which nobody is sweeping at any rate this relay would allow.
+const ROOM_RE = /^[a-hjkmnp-z2-9]{12}$/;
+
+/// A room nobody has shared to in this long is forgotten. Long enough that a
+/// link used once a month keeps working, short enough that abandoned ones do
+/// not pile up for ever.
+const ROOM_IDLE_MS = 180 * 24 * 60 * 60 * 1000;
+
 /// Per-IP budgets. Creating sessions is cheap to do and expensive to absorb;
 /// looking up codes is the enumeration path and is held much tighter.
+///
+/// Rooms get their own, looser, budget: a page left open on a bookmarked link
+/// asks every few seconds whether anything is live, and a room name is far
+/// too long to be worth sweeping for.
 const LIMITS = {
   create: { tokens: 20, refillMs: 60_000 },
   lookup: { tokens: 30, refillMs: 60_000 },
+  room: { tokens: 40, refillMs: 60_000 },
 };
 
 // ---------------------------------------------------------------------------
@@ -118,7 +145,17 @@ export class SignallingSession {
         return json({ ok: true });
       }
 
+      case "lock": {
+        if (!(await this.authorised(request))) return json({ error: "denied" }, 403);
+        await store.put("locked", (await request.text()).trim() === "1");
+        return json({ ok: true });
+      }
+
       case "get-offer": {
+        // Said before anything else, and said as its own status, so the
+        // viewer can tell "not letting anyone in right now" from "no such
+        // stream" and wait rather than give up.
+        if (await store.get("locked")) return json({ error: "locked" }, 423);
         // A claimed session is finished. Refusing here is what makes a code
         // worthless once it has been used, rather than merely stale.
         if (await store.get("claimed")) return json({ error: "already claimed" }, 410);
@@ -127,6 +164,7 @@ export class SignallingSession {
       }
 
       case "answer": {
+        if (await store.get("locked")) return json({ error: "locked" }, 423);
         // The claim and the write happen together, so a second answer cannot
         // land between another viewer's check and their write.
         if (await store.get("claimed")) return json({ error: "already claimed" }, 409);
@@ -167,6 +205,66 @@ export class SignallingSession {
     const expected = await this.state.storage.get("tokenHash");
     if (!expected) return false;
     return timingSafeEqual(await sha256Hex(presented), expected);
+  }
+
+  async alarm() {
+    await this.state.storage.deleteAll();
+  }
+}
+
+/// A permanent link: which code, if any, is live under it right now.
+///
+/// Trust on first use. The first host to publish to a room sets its key, and
+/// from then on only that key can change it. Nobody else can get there first,
+/// because the name is generated on the host and nobody else knows it until
+/// the host has already used it.
+export class Room {
+  constructor(state) {
+    this.state = state;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    const action = url.pathname.slice(1);
+    const store = this.state.storage;
+
+    if (action === "get") {
+      const code = await store.get("code");
+      return json(code ? { live: true, code } : { live: false });
+    }
+
+    const presented = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
+    if (!presented) return json({ error: "denied" }, 403);
+    const hash = await sha256Hex(presented);
+    const known = await store.get("keyHash");
+
+    if (action === "publish") {
+      if (known && !timingSafeEqual(hash, known)) return json({ error: "denied" }, 403);
+      let code = "";
+      try {
+        code = String((JSON.parse(await request.text()) || {}).code || "");
+      } catch (_) {}
+      if (!CODE_RE.test(code)) return json({ error: "bad code" }, 400);
+      await store.put({ keyHash: hash, code, liveAt: Date.now() });
+      await store.setAlarm(Date.now() + ROOM_IDLE_MS);
+      return json({ ok: true });
+    }
+
+    // Everything else needs a room that exists and the key that made it.
+    if (!known || !timingSafeEqual(hash, known)) return json({ error: "denied" }, 403);
+
+    if (action === "clear") {
+      await store.delete("code");
+      return json({ ok: true });
+    }
+
+    if (action === "forget") {
+      await store.deleteAll();
+      await store.deleteAlarm();
+      return json({ ok: true });
+    }
+
+    return json({ error: "not found" }, 404);
   }
 
   async alarm() {
@@ -218,6 +316,17 @@ export default {
 
     if (parts[0] === "api" && parts[1] === "session") {
       return api(request, env, parts.slice(2));
+    }
+
+    if (parts[0] === "api" && parts[1] === "room") {
+      return roomApi(request, env, parts.slice(2));
+    }
+
+    // A permanent link. Anything that is not a well formed room name gets the
+    // ordinary page rather than an error, the same as a mistyped code does.
+    if (request.method === "GET" && parts[0] === "r") {
+      const room = (parts[1] || "").toLowerCase();
+      return html(page("", ROOM_RE.test(room) ? room : ""));
     }
 
     // Where to find a route, asked by the host at the start of a session.
@@ -317,8 +426,44 @@ async function api(request, env, rest) {
     return forward(object, "get-answer", request);
   }
 
+  if (action === "lock" && request.method === "PUT") {
+    return forward(object, "lock", request, (await request.text()).slice(0, 8));
+  }
+
   if (!action && request.method === "DELETE") {
     return forward(object, "destroy", request);
+  }
+
+  return json({ error: "not found" }, 404);
+}
+
+async function roomApi(request, env, rest) {
+  const room = (rest[0] || "").toLowerCase();
+  if (!ROOM_RE.test(room)) return json({ error: "bad room" }, 400);
+
+  const object = env.ROOMS.get(env.ROOMS.idFromName(room));
+  const action = rest[1];
+
+  if (!action && request.method === "GET") {
+    if (!(await allow(request, env, "room"))) return json({ error: "slow down" }, 429);
+    return forward(object, "get", request);
+  }
+
+  if (!action && request.method === "PUT") {
+    // Metered like creating a session, because the first publish to a name
+    // is what brings a room into existence.
+    if (!(await allow(request, env, "create"))) return json({ error: "slow down" }, 429);
+    const body = await request.text();
+    if (body.length > 256) return json({ error: "too large" }, 413);
+    return forward(object, "publish", request, body);
+  }
+
+  if (action === "live" && request.method === "DELETE") {
+    return forward(object, "clear", request);
+  }
+
+  if (!action && request.method === "DELETE") {
+    return forward(object, "forget", request);
   }
 
   return json({ error: "not found" }, 404);
@@ -440,7 +585,7 @@ function html(body) {
   });
 }
 
-function page(prefill) {
+function page(prefill, room = "") {
   return `<!doctype html>
 <meta charset="utf-8">
 <title>Sideband</title>
@@ -474,6 +619,12 @@ function page(prefill) {
   button { display:block; margin:0 auto; font:inherit; font-weight:600; color:#14181d;
     background:#f0a93b; border:0; border-radius:4px; padding:11px 26px; cursor:pointer; }
   button:disabled { background:#3d4652; color:#98a4b1; cursor:default; }
+  /* Over the picture, for the one case where a phone refused to start it
+     with sound: tapping this is the gesture it was waiting for. */
+  #unmute { position:fixed; left:50%; bottom:72px; transform:translateX(-50%); z-index:2; }
+  /* The attribute has to win over the display rules above, or a hidden
+     button is still a visible one. */
+  [hidden] { display:none !important; }
 </style>
 
 <div id="stage">
@@ -488,50 +639,214 @@ function page(prefill) {
       </g>
     </svg>
     <h1>Sideband</h1>
-    <p id="status">Enter the code you were given.</p>
-    <input id="code" maxlength="6" autocomplete="off" spellcheck="false" value="${prefill}">
+    <p id="status">${room ? "Tap Watch. It starts by itself whenever they are sharing." : "Enter the code you were given."}</p>
+    <input id="code" maxlength="6" autocomplete="off" spellcheck="false" value="${prefill}"${room ? " hidden" : ""}>
     <button id="go">Watch</button>
   </div>
   <video id="v" autoplay playsinline controls></video>
+  <button id="unmute" hidden>Tap for sound</button>
 </div>
 
 <script>
+// A permanent link names a room rather than a code. The room says which code
+// is live right now, so the same bookmark finds every session.
+const ROOM = '${room}';
+
 const statusEl = document.getElementById('status');
 const button = document.getElementById('go');
 const input = document.getElementById('code');
 const video = document.getElementById('v');
 const panel = document.getElementById('panel');
+const unmute = document.getElementById('unmute');
 const say = (t) => { statusEl.textContent = t; };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Who this is, for the host's list of people watching. A random name kept in
+// this browser, so somebody the host removed is recognised if they come
+// straight back, and a rough description of the device, so the list reads
+// "Android, Chrome" rather than an address nobody recognises. Nothing here
+// identifies a person, and nothing leaves this page except to the host.
+function randomId() {
+  const b = crypto.getRandomValues(new Uint8Array(12));
+  return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+}
+const VIEWER = (() => {
+  try {
+    let id = localStorage.getItem('sideband-viewer');
+    if (!id) { id = randomId(); localStorage.setItem('sideband-viewer', id); }
+    return id;
+  } catch (_) {
+    return randomId();
+  }
+})();
+function device() {
+  const ua = navigator.userAgent;
+  const os = /iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) ? 'iPad'
+    : /Android/.test(ua) ? 'Android' : /Windows/.test(ua) ? 'Windows'
+    : /CrOS/.test(ua) ? 'Chromebook' : /Mac OS X/.test(ua) ? 'Mac'
+    : /Linux/.test(ua) ? 'Linux' : 'Device';
+  const browser = /Edg[/]/.test(ua) ? 'Edge' : /OPR[/]|Opera/.test(ua) ? 'Opera'
+    : /Firefox[/]|FxiOS/.test(ua) ? 'Firefox' : /SamsungBrowser/.test(ua) ? 'Samsung Internet'
+    : /Chrome[/]|CriOS/.test(ua) ? 'Chrome' : /Safari[/]/.test(ua) ? 'Safari' : 'browser';
+  return os + ', ' + browser;
+}
+
+// A phone that goes to sleep in the middle of a stream takes the stream with
+// it. Held only while something is actually on screen, and asked for again
+// when the page comes back to the front, because the browser lets go of it
+// whenever the page is hidden.
+let wake = null;
+let watching = false;
+async function keepAwake() {
+  try {
+    if (!wake && 'wakeLock' in navigator) {
+      wake = await navigator.wakeLock.request('screen');
+      wake.addEventListener('release', () => { wake = null; });
+    }
+  } catch (_) {
+    // Refused, or not supported. The stream works either way.
+  }
+}
+function letSleep() {
+  if (wake) { wake.release().catch(() => {}); wake = null; }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && watching) keepAwake();
+});
+
+function showVideo() {
+  watching = true;
+  panel.style.display = 'none';
+  video.style.display = 'block';
+  keepAwake();
+}
+function showPanel(msg) {
+  watching = false;
+  say(msg);
+  panel.style.display = '';
+  video.style.display = 'none';
+  unmute.hidden = true;
+  letSleep();
+}
+
+// Phones in particular refuse to start a video with sound unless it happens
+// in answer to a tap. Muted playback is always allowed, so the picture starts
+// regardless and the sound is one tap away rather than the whole thing
+// sitting on a black frame with no explanation.
+function play() {
+  const started = video.play();
+  if (started && started.catch) {
+    started.catch(() => {
+      video.muted = true;
+      video.play().catch(() => {});
+      unmute.hidden = false;
+    });
+  }
+}
+unmute.onclick = () => {
+  video.muted = false;
+  video.play().catch(() => {});
+  unmute.hidden = true;
+};
 
 input.addEventListener('keydown', (e) => { if (e.key === 'Enter') button.click(); });
+button.onclick = () => {
+  // Blesses the element while there is still a tap to bless it with, so the
+  // stream that arrives later, after all the waiting, may play with sound.
+  video.muted = false;
+  video.play().catch(() => {});
+  return ROOM ? watchRoom() : watchCode();
+};
 
-button.onclick = async () => {
+// Resolves once the connection is over for good. Disconnected is given a few
+// seconds first: it is what a brief blip looks like, and connections come
+// back from it all the time.
+function ended(pc) {
+  return new Promise((resolve) => {
+    let timer = null;
+    const check = () => {
+      const s = pc.connectionState;
+      if (s === 'failed' || s === 'closed') {
+        clearTimeout(timer);
+        resolve();
+      } else if (s === 'disconnected') {
+        if (!timer) {
+          timer = setTimeout(() => {
+            if (pc.connectionState !== 'connected') resolve();
+          }, 5000);
+        }
+      } else if (s === 'connected') {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+    pc.addEventListener('connectionstatechange', check);
+    check();
+  });
+}
+
+async function watchCode() {
   const code = input.value.trim().toUpperCase();
   if (!/^[A-Z2-9]{6}$/.test(code)) { say('That code does not look right.'); return; }
   button.disabled = true;
   input.disabled = true;
 
-  const reset = (msg) => {
-    say(msg);
-    panel.style.display = '';
-    video.style.display = 'none';
-    button.disabled = false;
-    input.disabled = false;
-  };
-
   try {
-    const pc = await connectWithRetry(code, say, reset);
-    panel.style.display = 'none';
-    video.style.display = 'block';
-    pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-        reset('Disconnected.');
-      }
-    };
+    const pc = await connectWithRetry(code, say, 25000);
+    showVideo();
+    await ended(pc);
+    try { pc.close(); } catch (_) {}
+    showPanel('Disconnected.');
   } catch (e) {
-    reset(e.message);
+    showPanel(e.message);
   }
-};
+  button.disabled = false;
+  input.disabled = false;
+}
+
+// Watches for as long as the page is open. Asks the room what is live, joins
+// it, and when it ends, whether they stopped sharing or the connection
+// dropped, goes back to asking. Nobody has to send a new link or press
+// anything again.
+async function watchRoom() {
+  button.hidden = true;
+  for (;;) {
+    let code = '';
+    try {
+      const res = await fetch('/api/room/' + ROOM, { cache: 'no-store' });
+      if (res.status === 429) {
+        say('Checking too often. Waiting a moment…');
+        await sleep(15000);
+        continue;
+      }
+      if (res.ok) {
+        const body = await res.json();
+        if (body.live) code = body.code;
+      }
+    } catch (_) {
+      say('Could not reach the server. Trying again…');
+      await sleep(5000);
+      continue;
+    }
+
+    if (!code) {
+      say('Not live right now. This starts by itself when they are.');
+      await sleep(5000);
+      continue;
+    }
+
+    try {
+      const pc = await connectWithRetry(code, say, 25000);
+      showVideo();
+      await ended(pc);
+      try { pc.close(); } catch (_) {}
+      showPanel('The stream stopped. Waiting for it to come back…');
+    } catch (e) {
+      say(e.message);
+      await sleep(4000);
+    }
+  }
+}
 
 // Waits for ICE gathering on evidence rather than a fixed deadline: as soon as
 // a usable set of candidates exists we go, and we only give up early if the
@@ -551,11 +866,13 @@ async function gather(pc, { minCandidates = 2, settle = 700, hardCap = 12000 } =
   while (Date.now() - started < hardCap) {
     if (pc.iceGatheringState === 'complete') return;
     if (count >= minCandidates && lastAt && Date.now() - lastAt > settle) return;
-    await new Promise((r) => setTimeout(r, 100));
+    await sleep(100);
   }
 
   if (count === 0) throw new Error('No network route found. A firewall or VPN may be blocking it.');
 }
+
+const LOCKED = 'They are not letting anyone new in right now.';
 
 async function attempt(code, onStatus) {
   onStatus('Looking up the stream…');
@@ -564,6 +881,7 @@ async function attempt(code, onStatus) {
   // viewer leaves, the host publishes a new offer under the same code within a
   // few seconds, so this is worth waiting through rather than giving up on.
   if (res.status === 410) throw new Error('Someone is watching. Waiting…');
+  if (res.status === 423) throw new Error(LOCKED);
   if (res.status === 429) throw new Error('Too many attempts. Wait a moment.');
   if (res.status === 404) throw new Error('No stream with that code. It may have expired.');
   if (!res.ok) throw new Error('Could not reach the server.');
@@ -593,15 +911,22 @@ async function attempt(code, onStatus) {
   // Attached before setRemoteDescription: a track can arrive the moment the
   // description is applied, and a listener added afterwards would miss it.
   pc.ontrack = (e) => {
-    if (video.srcObject !== e.streams[0]) video.srcObject = e.streams[0];
+    if (video.srcObject !== e.streams[0]) {
+      video.srcObject = e.streams[0];
+      play();
+    }
   };
 
+  // Seventy seconds, not twenty five. The host may have to press "allow",
+  // and it asks for a minute before giving up on an answer; a page that gave
+  // up first was a viewer let in to a connection they had already abandoned.
+  // A route that genuinely fails says so long before this, as "failed".
   const connected = new Promise((resolve, reject) => {
     pc.addEventListener('connectionstatechange', () => {
       if (pc.connectionState === 'connected') resolve();
       if (pc.connectionState === 'failed') reject(new Error('Connection failed.'));
     });
-    setTimeout(() => reject(new Error('Timed out connecting.')), 25000);
+    setTimeout(() => reject(new Error('Timed out connecting.')), 70000);
   });
 
   await pc.setRemoteDescription({ type: 'offer', sdp: offer });
@@ -611,29 +936,33 @@ async function attempt(code, onStatus) {
   await gather(pc);
 
   onStatus('Connecting…');
+  // Two lines ahead of the answer itself, for the host's list of people
+  // watching. The host takes them off again before the answer is used.
+  const about = 'x-sideband-viewer:' + VIEWER + '\\r\\n' + 'x-sideband-device:' + device() + '\\r\\n';
   const post = await fetch('/api/session/' + code + '/answer', {
     method: 'POST',
-    body: pc.localDescription.sdp,
+    body: about + pc.localDescription.sdp,
   });
   if (post.status === 409) throw new Error('Someone else is already watching with that code.');
+  if (post.status === 423) throw new Error(LOCKED);
   if (!post.ok) throw new Error('Could not send the reply.');
 
+  onStatus('Connecting… If they have to let you in, this waits for them.');
   await connected;
   return pc;
 }
 
-// One retry only, and only for failures that happen after the code was
-// accepted, a claimed or expired code will not become valid by asking again.
-async function connectWithRetry(code, onStatus, onFailure) {
-  // Bounded, and bounded is the point.
-  //
-  // Two states look like failure and are not: the host rebuilding its offer
-  // after a viewer left, and a connection that simply did not take. Both clear
-  // within seconds. An earlier version waited through them with no limit and
-  // sat repeating itself for ever when they did not clear, which is a worse
-  // way to fail than saying so. Anything that cannot come right by waiting,
-  // a code that never existed or a rate limit, is not waited on at all.
-  const deadline = Date.now() + 25000;
+// Bounded, and bounded is the point.
+//
+// Some states look like failure and are not: the host rebuilding its offer
+// after a viewer left, a connection that simply did not take, and a host that
+// has stopped letting people in for a moment. All of them clear by waiting.
+// An earlier version waited through them with no limit and sat repeating
+// itself for ever when they did not clear, which is a worse way to fail than
+// saying so. Anything that cannot come right by waiting, a code that never
+// existed or a rate limit, is not waited on at all.
+async function connectWithRetry(code, onStatus, patience) {
+  const deadline = Date.now() + patience;
   for (;;) {
     try {
       return await attempt(code, onStatus);
@@ -645,10 +974,12 @@ async function connectWithRetry(code, onStatus, onFailure) {
           ? 'Someone else is watching this one.'
           : e.message);
       }
+      const locked = e.message === LOCKED;
       onStatus(/watching/.test(e.message)
         ? 'Waiting for the stream to free up…'
+        : locked ? LOCKED + ' Waiting…'
         : 'That did not take - trying again…');
-      await new Promise((r) => setTimeout(r, 1500));
+      await sleep(locked ? 4000 : 1500);
     }
   }
 }

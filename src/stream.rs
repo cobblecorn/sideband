@@ -21,9 +21,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::audio::OpusPacket;
+use crate::chime::{self, Chime};
 use crate::pipeline::VideoEncoder;
-use crate::session::{Phase, Session};
-use crate::{bwe, capture, encoder, hotkey, loopback, mic, net, pipeline, scale, server, sources};
+use crate::session::{Phase, Session, ViewerInfo};
+use crate::settings::Settings;
+use crate::{
+    bwe, capture, card, encoder, hotkey, loopback, mic, net, pipeline, portmap, scale, server,
+    sources,
+};
 
 /// The fastest we ever capture or send. The rate controller may settle below
 /// this, see `bwe`, but never above it, because the source cannot produce
@@ -88,6 +93,10 @@ fn with_runtime<F>(session: Arc<Session>, body: F) -> Result<(), String>
 where
     F: FnOnce(tokio::runtime::Runtime) -> Result<(), String>,
 {
+    // The hotkeys follow whichever session is current. Registered once for
+    // the process, see `hotkey`, and pointed here.
+    hotkey::attach(&session);
+
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
@@ -184,7 +193,7 @@ async fn serve_local(pid: u32, port: u16, session: Arc<Session>) -> Result<(), S
     let answer = {
         let mut answer = answer;
         loop {
-            match approved(&answer, &session).await {
+            match approved(&describe_viewer(&answer), &session).await {
                 Decision::Allowed => break answer,
                 Decision::Refused => return Err("you turned that viewer away".into()),
                 Decision::Unanswered => {
@@ -209,7 +218,7 @@ async fn serve_local(pid: u32, port: u16, session: Arc<Session>) -> Result<(), S
         .map_err(|_| "the viewer answered but never connected".to_string())?;
 
     session.set_phase(Phase::Live);
-    pump(&webrtc, keyframe, session).await
+    pump(&webrtc, keyframe, session, None).await
 }
 
 /// How long a capture that has never produced a frame is given before it is
@@ -259,13 +268,221 @@ async fn serve_relay(pid: u32, relay: String, session: Arc<Session>) -> Result<(
     // own code, that would let one be squatted, and would leave the relay
     // nothing to attach a per-client limit to.
     let ticket = create_session(&relay).await?;
-    let link = format!("{relay}/{}", ticket.code);
+
+    // The link handed out is the permanent one whenever the relay keeps one:
+    // the same link as last time and the time before, so a bookmark finds
+    // this session without anybody sending anything. The code still works
+    // on its own, for reading out.
+    let room = claim_room(&relay, &ticket.code, &session).await;
+    let link = share_link(&relay, &ticket, room.as_ref());
+    let mut share = Share { ticket, link, room };
 
     // Whatever happens from here, the session is torn down rather than left
-    // sitting on the relay until it expires.
-    let outcome = relay_attempts(&relay, &ticket, &link, Arc::clone(&session)).await;
-    destroy_session(&relay, &ticket).await;
+    // sitting on the relay until it expires, and the permanent link stops
+    // pointing at it, so a page open on it says "not live" straight away.
+    let outcome = relay_attempts(&relay, &mut share, Arc::clone(&session)).await;
+    if let Some(room) = share.room.clone() {
+        let relay = relay.clone();
+        let _ = tokio::task::spawn_blocking(move || room_clear(&relay, &room)).await;
+    }
+    destroy_session(&relay, &share.ticket).await;
     outcome
+}
+
+/// What is being handed out right now. All of it changes when a new link is
+/// asked for.
+struct Share {
+    ticket: Ticket,
+    link: String,
+    /// The permanent link, when the relay has one for this machine.
+    room: Option<Room>,
+}
+
+/// A permanent link, see the relay's `Room`.
+#[derive(Clone)]
+struct Room {
+    name: String,
+    /// Proves this machine owns it. Held in the settings file, and only ever
+    /// sent to the relay.
+    key: String,
+}
+
+fn share_link(relay: &str, ticket: &Ticket, room: Option<&Room>) -> String {
+    match room {
+        Some(r) => format!("{relay}/r/{}", r.name),
+        None => format!("{relay}/{}", ticket.code),
+    }
+}
+
+/// Points this machine's permanent link at `code`, making the link first if
+/// there has never been one.
+///
+/// Failing is not failing to share: the code, and the link made from it,
+/// work exactly as they always have, and the read-out says the permanent one
+/// is not available this time.
+async fn claim_room(relay: &str, code: &str, session: &Arc<Session>) -> Option<Room> {
+    let mut settings = Settings::load_stored();
+    if settings.ensure_room() {
+        settings.save();
+    }
+    let room = Room { name: settings.room, key: settings.room_key };
+
+    let (r, c, at) = (room.clone(), code.to_owned(), relay.to_owned());
+    let published = tokio::task::spawn_blocking(move || room_publish(&at, &r, &c))
+        .await
+        .unwrap_or_else(|e| Err(format!("{e}")));
+
+    match published {
+        Ok(()) => Some(room),
+        Err(e) => {
+            session.note(format!(
+                "the permanent link is not available ({e}), so this link only works while you share"
+            ));
+            None
+        }
+    }
+}
+
+fn room_publish(relay: &str, room: &Room, code: &str) -> Result<(), String> {
+    ureq::put(&format!("{relay}/api/room/{}", room.name))
+        .header("Authorization", &format!("Bearer {}", room.key))
+        .send_json(serde_json::json!({ "code": code }))
+        .map(|_| ())
+        .map_err(|e| match e {
+            ureq::Error::StatusCode(403) => "the relay says that link belongs to another machine".into(),
+            ureq::Error::StatusCode(404) => "the relay needs updating to keep one".into(),
+            e => e.to_string(),
+        })
+}
+
+/// Best effort, as tearing down the session is: the relay forgets a room
+/// nobody has shared to in months regardless.
+fn room_clear(relay: &str, room: &Room) {
+    let _ = ureq::delete(&format!("{relay}/api/room/{}/live", room.name))
+        .header("Authorization", &format!("Bearer {}", room.key))
+        .call();
+}
+
+/// Retires a permanent link for good, so whoever holds it finds nothing
+/// there ever again. Blocking; the window calls it from a thread of its own
+/// when a new link is asked for between sessions.
+pub fn room_forget(relay: &str, name: &str, key: &str) {
+    let relay = relay.trim().trim_end_matches('/');
+    if relay.is_empty() || name.is_empty() {
+        return;
+    }
+    let _ = ureq::delete(&format!("{relay}/api/room/{name}"))
+        .header("Authorization", &format!("Bearer {key}"))
+        .call();
+}
+
+/// A new code and a new permanent link, the old ones stopped.
+///
+/// For a link that has been passed on further than it should have been.
+/// Everybody already watching stays: they are connected to this machine
+/// directly and the link has nothing more to do with them. Removing one of
+/// them is what the remove button is for.
+async fn new_link(relay: &str, share: &mut Share, session: &Arc<Session>, someone_watching: bool) {
+    let fresh = match create_session(relay).await {
+        Ok(t) => t,
+        Err(e) => {
+            session.note(format!("could not make a new code: {e}"));
+            return;
+        }
+    };
+    let old = std::mem::replace(&mut share.ticket, fresh);
+    destroy_session(relay, &old).await;
+
+    if let Some(room) = share.room.take() {
+        let relay = relay.to_owned();
+        let _ = tokio::task::spawn_blocking(move || room_forget(&relay, &room.name, &room.key)).await;
+    }
+    let mut settings = Settings::load_stored();
+    settings.new_room();
+    settings.save();
+    share.room = claim_room(relay, &share.ticket.code, session).await;
+    share.link = share_link(relay, &share.ticket, share.room.as_ref());
+
+    session.set_share(Some(share.ticket.code.clone()), share.link.clone());
+    if !someone_watching {
+        session.set_phase(Phase::Waiting {
+            code: Some(share.ticket.code.clone()),
+            link: share.link.clone(),
+        });
+    }
+    session.tell("new link and code. The old ones have stopped working; anyone watching stays.");
+}
+
+/// Tells the relay whether to turn new viewers away. Best effort: if this
+/// does not arrive, nothing new is offered while locked anyway, so the worst
+/// case is a viewer waiting rather than being told why.
+async fn set_relay_lock(relay: &str, ticket: &Ticket, locked: bool) {
+    let url = format!("{relay}/api/session/{}/lock", ticket.code);
+    let token = ticket.token.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        ureq::put(&url)
+            .header("Authorization", &format!("Bearer {token}"))
+            .send(if locked { "1" } else { "0" })
+    })
+    .await;
+}
+
+/// Results of admitting somebody that are not failures, and must not count
+/// towards giving up. A session left open all evening sees plenty of them.
+const INTERRUPTED: &str = "stopped waiting for this viewer";
+const TURNED_AWAY: &str = "that viewer was turned away earlier";
+const REFUSED: &str = "you turned that viewer away";
+const NOBODY_YET: &str = "nobody has joined yet";
+const UNANSWERED: &str = "nobody answered";
+
+fn benign(e: &str) -> bool {
+    [INTERRUPTED, TURNED_AWAY, REFUSED, NOBODY_YET, UNANSWERED, "cancelled"].contains(&e)
+}
+
+/// Why a viewer's send loop ended when they simply went away.
+const VIEWER_LEFT: &str = "the viewer's connection dropped";
+
+/// What a viewer's page says about itself, on two lines ahead of its answer.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct About {
+    /// The random name the page keeps in its browser.
+    browser: String,
+    /// "Android, Chrome" and the like.
+    device: String,
+}
+
+/// Takes the page's own lines off an answer, leaving the answer.
+///
+/// They have to come off: they are not SDP, and the answer is handed to the
+/// WebRTC stack exactly as the browser wrote it. Cleaned on the way, because
+/// anybody holding a code can put anything they like there, and it ends up
+/// in the window.
+fn split_about(answer: &str) -> (About, String) {
+    let clean = |v: &str| -> String {
+        v.trim().chars().filter(|c| !c.is_control()).take(40).collect()
+    };
+    let mut about = About::default();
+    let mut sdp = String::with_capacity(answer.len());
+    for line in answer.split_inclusive('\n') {
+        let t = line.trim();
+        if let Some(v) = t.strip_prefix("x-sideband-viewer:") {
+            about.browser = clean(v);
+        } else if let Some(v) = t.strip_prefix("x-sideband-device:") {
+            about.device = clean(v);
+        } else {
+            sdp.push_str(line);
+        }
+    }
+    (about, sdp)
+}
+
+/// Somebody let in, and what comes with them.
+struct Admitted<P: webrtc::peer_connection::PeerConnection> {
+    net: net::Session<P>,
+    /// The port the router opened for them. Held for as long as they watch;
+    /// dropping it closes the port.
+    opening: Option<portmap::Opening>,
+    viewer: ViewerInfo,
 }
 
 /// Admits one viewer: a fresh offer, published under the same code, and the
@@ -274,6 +491,7 @@ async fn serve_relay(pid: u32, relay: String, session: Arc<Session>) -> Result<(
 /// One connection per viewer is not a choice, it is how WebRTC works: a peer
 /// connection takes exactly one answer. Publishing a new offer also re-arms
 /// the code, so the next person to open the link finds it working.
+#[allow(clippy::too_many_arguments)]
 async fn admit_one(
     relay: &str,
     ticket: &Ticket,
@@ -281,13 +499,37 @@ async fn admit_one(
     session: &Arc<Session>,
     watching: usize,
     ice: &[net::RTCIceServer],
+    router: Option<&Arc<portmap::Router>>,
+    id: u64,
 //
 // `use<>` captures nothing: without it the returned connection borrows every
 // argument for its whole life, which makes it unable to leave the task that
 // built it, and admitting viewers happens on a task of its own.
-) -> Result<net::Session<impl webrtc::peer_connection::PeerConnection + use<>>, String> {
+) -> Result<Admitted<impl webrtc::peer_connection::PeerConnection + use<>>, String> {
     let webrtc = net::connect(ice.to_vec()).await?;
 
+    // Every way out that is not success closes the connection. One left
+    // open keeps its ICE agent answering on a port nobody is using.
+    match admit_on(&webrtc, relay, ticket, link, session, watching, router, id).await {
+        Ok((opening, viewer)) => Ok(Admitted { net: webrtc, opening, viewer }),
+        Err(e) => {
+            webrtc.close().await;
+            Err(e)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn admit_on<P: webrtc::peer_connection::PeerConnection>(
+    webrtc: &net::Session<P>,
+    relay: &str,
+    ticket: &Ticket,
+    link: &str,
+    session: &Arc<Session>,
+    watching: usize,
+    router: Option<&Arc<portmap::Router>>,
+    id: u64,
+) -> Result<(Option<portmap::Opening>, ViewerInfo), String> {
     // The read-out is only narrated while nobody is watching yet.
     //
     // Admitting the next person happens continuously in the background, and
@@ -302,6 +544,30 @@ async fn admit_one(
     }
     let offer = webrtc.offer().await?;
 
+    // A door through the router for this viewer, when the router will give
+    // one, advertised in the offer as one more place to knock. It is what
+    // lets in the viewers nothing else can, phones on mobile data above all:
+    // see `portmap`.
+    let opening = match (router, portmap::host_port(&offer)) {
+        (Some(router), Some(port)) => {
+            let router = Arc::clone(router);
+            match tokio::task::spawn_blocking(move || portmap::open(&router, port)).await {
+                Ok(Ok(opening)) => Some(opening),
+                Ok(Err(e)) => {
+                    eprintln!("  router: {e}");
+                    session.set_reach(false, e);
+                    None
+                }
+                Err(_) => None,
+            }
+        }
+        _ => None,
+    };
+    let offer = match &opening {
+        Some(o) => portmap::with_public_candidate(&offer, o.port(), o.public()),
+        None => offer,
+    };
+
     if narrate {
         session.preparing("publishing to the relay");
     }
@@ -315,22 +581,41 @@ async fn admit_one(
     }
 
     let answer = poll_answer(relay, ticket, session).await?;
+    let (about, answer) = split_about(&answer);
+    let address = describe_viewer(&answer);
+    let viewer = ViewerInfo {
+        id,
+        device: about.device,
+        address: if address == NO_ADDRESS { String::new() } else { address },
+        browser: about.browser,
+        since: Instant::now(),
+    };
 
-    match approved(&answer, session).await {
+    // Removed, or turned away, earlier in this session. Not asked about again
+    // and not announced: the point of removing somebody is not hearing from
+    // them, and their page keeps retrying.
+    if session.is_banned(&viewer.browser, &viewer.address) {
+        return Err(TURNED_AWAY.into());
+    }
+
+    match approved(&viewer.describe(), session).await {
         Decision::Allowed => {}
         Decision::Refused => {
-            webrtc.close().await;
-            return Err("you turned that viewer away".into());
+            // Kept out for the rest of the session, so saying no once is
+            // enough. It used to end the whole session instead, which was
+            // a fair answer when a code admitted one person, and is not one
+            // when others are watching on the same link.
+            session.ban(&viewer.browser, &viewer.address);
+            return Err(REFUSED.into());
         }
         Decision::Unanswered => {
-            webrtc.close().await;
             session.note(
                 "nobody answered the prompt here, so that viewer was not let in. \
-                 The same code still works: turn on auto admit if you are the one \
+                 The same link still works: turn on auto admit if you are the one \
                  at the other end."
                     .to_owned(),
             );
-            return Err("nobody answered".into());
+            return Err(UNANSWERED.into());
         }
     }
 
@@ -340,16 +625,16 @@ async fn admit_one(
     webrtc.accept_answer(&answer).await?;
 
     match tokio::time::timeout(CONNECT_TIMEOUT, webrtc.wait_connected()).await {
-        Ok(()) => Ok(webrtc),
+        Ok(()) => Ok((opening, viewer)),
         Err(_) => {
-            webrtc.close().await;
             let routes = viewer_routes(&answer);
             Err(format!(
-                "that viewer answered but never connected. They offered {routes}{}",
-                if net::have_turn() {
+                "{} answered but never connected. They offered {routes}{}",
+                viewer.describe(),
+                if net::have_turn() || opening.is_some() {
                     "."
                 } else {
-                    ", and there is no TURN relay configured to fall back on."
+                    ", and there is no way through the router for them to fall back on."
                 }
             ))
         }
@@ -360,12 +645,16 @@ async fn admit_one(
 ///
 /// Admitting somebody and admitting somebody *else* are the same operation, so
 /// the code keeps working rather than being spent on whoever got there first.
-async fn relay_attempts(
-    relay: &str,
-    ticket: &Ticket,
-    link: &str,
-    session: Arc<Session>,
-) -> Result<(), String> {
+async fn relay_attempts(relay: &str, share: &mut Share, session: Arc<Session>) -> Result<(), String> {
+    // Looked for while the relay is asked for its route options, so neither
+    // waits on the other. A router that answers does so in milliseconds, and
+    // one that does not costs a few seconds here, once, rather than per viewer.
+    let router_search = Settings::load()
+        .open_ports
+        .then(net::local_ip)
+        .flatten()
+        .map(|ip| tokio::task::spawn_blocking(move || portmap::Router::find(ip)));
+
     // Asked of the relay once, and shared by every viewer admitted after.
     //
     // The relay is the piece of the setup that is already shared, so putting
@@ -377,20 +666,63 @@ async fn relay_attempts(
         None => (net::ice_servers(), net::have_turn()),
     };
 
-    if !have_turn {
-        let warning = "no TURN relay configured, so viewers on mobile data, or on a \
-             network that keeps its devices apart, will not be able to connect. \
-             Most home connections do not need one.";
+    let router = match router_search {
+        Some(search) => match search.await {
+            Ok(Ok(found)) => {
+                session.set_reach(
+                    true,
+                    format!("router opens a port for each viewer, at {}", found.external()),
+                );
+                Some(Arc::new(found))
+            }
+            Ok(Err(why)) => {
+                session.set_reach(have_turn, why);
+                None
+            }
+            Err(_) => None,
+        },
+        None => {
+            session.set_reach(have_turn, "opening router ports is turned off");
+            None
+        }
+    };
+
+    // Said once, and only when it is true: with neither a relay of last
+    // resort nor a way through the router, the viewers who cannot reach this
+    // machine directly have no way in at all, and nothing else would say so.
+    if router.is_none() && !have_turn {
+        let why = session.reach().map(|(_, w)| w).unwrap_or_default();
+        let warning = format!(
+            "{why}. Viewers on mobile data may not be able to connect; most others will."
+        );
         eprintln!("  note: {warning}");
-        session.note(warning.to_owned());
+        session.note(warning);
     }
 
     let mut watching: tokio::task::JoinSet<Result<(), String>> = tokio::task::JoinSet::new();
+    // Which viewer each task is serving, so the one that finished can be
+    // taken off the list, even if it finished by panicking.
+    let mut serving: std::collections::HashMap<tokio::task::Id, u64> = Default::default();
+    let mut next_id = 1u64;
     let mut failures = 0usize;
+    // What the relay was last told, so it is only told again on a change.
+    let mut relay_locked = false;
 
     loop {
         if session.should_stop() {
             break;
+        }
+
+        if session.take_new_link() {
+            new_link(relay, share, &session, !watching.is_empty()).await;
+            // A new code on the relay starts unlocked.
+            relay_locked = false;
+        }
+
+        let locked = session.locked();
+        if locked != relay_locked {
+            set_relay_lock(relay, &share.ticket, locked).await;
+            relay_locked = locked;
         }
 
         // Read before the select, because the arms below borrow the set.
@@ -399,47 +731,81 @@ async fn relay_attempts(
         tokio::select! {
             // Somebody left. With nobody watching this goes back to offering
             // and waiting; with others still connected it changes nothing.
-            Some(finished) = watching.join_next(), if !watching.is_empty() => {
-                session.set_watching(watching.len() as u32);
-                if let Ok(Err(e)) = finished {
-                    session.note(format!("{e}. The same code still works."));
+            Some(finished) = watching.join_next_with_id(), if !watching.is_empty() => {
+                let (task, result) = match finished {
+                    Ok((task, result)) => (task, result),
+                    Err(e) => (e.id(), Err("stopped unexpectedly".to_owned())),
+                };
+                if let Some(id) = serving.remove(&task) {
+                    let removed = session.is_kicked(id);
+                    let who = session
+                        .remove_viewer(id)
+                        .map(|v| v.describe())
+                        .unwrap_or_else(|| "someone".to_owned());
+                    if removed {
+                        session.tell(format!("removed {who}. They cannot come back this session."));
+                    } else {
+                        if session.sounds() {
+                            chime::play(Chime::Left);
+                        }
+                        match result {
+                            Err(e) if e != VIEWER_LEFT => session.note(format!("{who}: {e}")),
+                            _ => session.tell(format!("{who} left")),
+                        }
+                    }
                 }
                 if watching.is_empty() && !session.should_stop() {
                     session.set_phase(Phase::Waiting {
-                        code: Some(ticket.code.clone()),
-                        link: link.to_owned(),
+                        code: Some(share.ticket.code.clone()),
+                        link: share.link.clone(),
                     });
                 }
             }
 
-            admitted = admit_one(relay, ticket, link, &session, already_watching, &ice) => {
+            admitted = admit_one(
+                relay,
+                &share.ticket,
+                &share.link,
+                &session,
+                already_watching,
+                &ice,
+                router.as_ref(),
+                next_id,
+            ), if !locked => {
                 match admitted {
-                    Ok(viewer) => {
+                    Ok(Admitted { net: viewer, opening, viewer: info }) => {
                         failures = 0;
-                        if already_watching > 0 {
-                            session.note("somebody else is watching too.".to_owned());
-                        }
+                        next_id += 1;
+                        let id = info.id;
+                        let who = info.describe();
+                        session.add_viewer(info);
                         session.set_phase(Phase::Live);
-                        session.set_watching(already_watching as u32 + 1);
+                        session.tell(format!("{who} is watching"));
+                        if session.sounds() {
+                            chime::play(Chime::Joined);
+                        }
 
                         let session = Arc::clone(&session);
-                        watching.spawn(async move {
+                        let task = watching.spawn(async move {
+                            // Held rather than used: dropping it is what
+                            // closes the port on the router again.
+                            let _opening = opening;
                             let keyframe = viewer.keyframe_signal();
-                            let result = pump(&viewer, keyframe, session).await;
+                            let result = pump(&viewer, keyframe, session, Some(id)).await;
                             viewer.close().await;
                             result
                         });
+                        serving.insert(task.id(), id);
                     }
-                    Err(e) if e == "you turned that viewer away" => {
-                        if watching.is_empty() {
-                            return Err(e);
-                        }
-                    }
-                    Err(_) => {
-                        // A failed admission leaves the code alive, so this
-                        // goes round again and offers afresh. The count only
-                        // gives up when nobody is watching at all.
-                        if watching.is_empty() {
+                    Err(e) => {
+                        // A prompt answered while others watch leaves the
+                        // window on the prompt otherwise.
+                        if !watching.is_empty() {
+                            session.set_phase(Phase::Live);
+                        } else if !benign(&e) {
+                            // A failed admission leaves the code alive, so this
+                            // goes round again and offers afresh. The count only
+                            // gives up when nobody is watching at all.
                             failures += 1;
                             if failures >= MAX_ATTEMPTS {
                                 return Err(
@@ -450,6 +816,10 @@ async fn relay_attempts(
                     }
                 }
             }
+
+            // Locked: nothing is offered, and this only wakes the loop to see
+            // whether that has changed.
+            _ = tokio::time::sleep(Duration::from_millis(300)), if locked => {}
         }
     }
 
@@ -529,6 +899,11 @@ async fn poll_answer(
             if session.should_stop() {
                 return Err("cancelled".into());
             }
+            // Both of these change what should be on offer, so the offer
+            // waiting here is withdrawn and the loop decides what comes next.
+            if session.locked() || session.new_link_pending() {
+                return Err(INTERRUPTED.into());
+            }
             let request = ureq::get(&url).header("Authorization", &format!("Bearer {token}"));
             match request.call() {
                 Ok(mut r) => {
@@ -546,7 +921,9 @@ async fn poll_answer(
             }
             std::thread::sleep(Duration::from_millis(700));
         }
-        Err("nobody joined before the code expired".to_owned())
+        // Not a failure. Going round again publishes a fresh offer, which is
+        // also what keeps the relay from expiring a code nobody has used yet.
+        Err(NOBODY_YET.to_owned())
     })
     .await
     .map_err(|e| format!("poll task failed: {e}"))?
@@ -583,16 +960,15 @@ enum Decision {
     Unanswered,
 }
 
-async fn approved(answer: &str, session: &Arc<Session>) -> Decision {
-    // Asked for explicitly, so there is nobody to ask. The viewer is still
-    // named in the read-out rather than let in silently: not having to answer
-    // is the point, not being unable to see who arrived.
+async fn approved(who: &str, session: &Arc<Session>) -> Decision {
+    // Asked for explicitly, so there is nobody to ask. They are still named
+    // once they are connected, with a sound: not having to answer is the
+    // point, not being unable to see who arrived.
     if session.auto_approve() {
-        session.note(format!("let {} in without asking", describe_viewer(answer)));
         return Decision::Allowed;
     }
 
-    session.request_approval(&describe_viewer(answer));
+    session.request_approval(who);
 
     let deadline = Instant::now() + APPROVAL_TIMEOUT;
     while Instant::now() < deadline {
@@ -665,9 +1041,11 @@ fn describe_viewer(answer: &str) -> String {
     // to one is often useless, say so rather than showing noise.
     match host_candidate {
         Some(a) if !a.ends_with(".local") => a,
-        _ => "address not shared".to_owned(),
+        _ => NO_ADDRESS.to_owned(),
     }
 }
+
+const NO_ADDRESS: &str = "address not shared";
 
 /// One line per second of what the viewer reported and what was decided.
 ///
@@ -754,14 +1132,10 @@ struct Media {
     video_thread: std::thread::JoinHandle<Result<(), String>>,
     audio_thread: std::thread::JoinHandle<Result<(), String>>,
     microphone: Arc<mic::Mic>,
-    resume_keyframe: net::KeyframeSignal,
 }
 
 impl Media {
     fn start(keyframe: net::KeyframeSignal, session: &Arc<Session>) -> Self {
-        // One clone stays here to force a refresh on resume; the other is
-        // moved into the encode thread, which services the request.
-        let resume_keyframe = keyframe.clone();
         let stop = Arc::new(AtomicBool::new(false));
 
         // Nothing is known about the viewer's connection yet, so the stream
@@ -774,18 +1148,18 @@ impl Media {
         // Whichever device was chosen in the window, or the default if that
         // one has since been unplugged.
         let chosen_mic = crate::settings::Settings::load().mic_device;
+        //
+        // The on switch is the session's, so the button, the hotkey and every
+        // viewer's microphone are one switch.
         let microphone = Arc::new(mic::Mic::start_on(
             Some(chosen_mic).filter(|id| !id.is_empty()),
             Arc::clone(&stop),
+            session.mic_flag(),
         ));
         if let Some(device) = microphone.opened() {
             session.set_mic_name(device.name.clone());
         }
         session.set_mic_available(microphone.available());
-        if microphone.available() {
-            let ui = Arc::clone(session);
-            hotkey::spawn_toggle(microphone.handle(), move |on| ui.set_mic_on(on));
-        }
 
         // Small queues on purpose: they exist to smooth jitter, not to buffer.
         let (video_tx, video_rx) = mpsc::channel::<(Vec<u8>, u64)>(4);
@@ -816,7 +1190,6 @@ impl Media {
             video_thread,
             audio_thread,
             microphone,
-            resume_keyframe,
         }
     }
 
@@ -857,13 +1230,17 @@ impl Media {
 /// The cost is real: an encoder session and an encode pass per viewer. It buys
 /// a second person who can actually see something, and a rate that follows
 /// their connection rather than the worst one in the room.
+///
+/// `id` is who this is on the session's list of viewers, when there is one,
+/// which is what lets the host remove them.
 async fn pump<P: webrtc::peer_connection::PeerConnection>(
     webrtc: &net::Session<P>,
     keyframe: net::KeyframeSignal,
     session: Arc<Session>,
+    id: Option<u64>,
 ) -> Result<(), String> {
     let mut media = Media::start(keyframe, &session);
-    let mut viewer = Viewer::new(webrtc);
+    let mut viewer = Viewer::new(webrtc, id);
 
     // Nothing ever arrives on this: the local path serves the one viewer it
     // was given. Holding the sender keeps the channel open so the receiver
@@ -882,7 +1259,10 @@ async fn pump<P: webrtc::peer_connection::PeerConnection>(
     };
 
     media.finish(&session);
-    if result.is_ok() {
+    // Only for the one viewer served locally. Through a relay, one person
+    // finishing is not the session finishing, and the loop admitting people
+    // is what decides the phase.
+    if result.is_ok() && id.is_none() {
         session.set_phase(Phase::Ended);
     }
     result
@@ -891,11 +1271,12 @@ async fn pump<P: webrtc::peer_connection::PeerConnection>(
 /// One person watching.
 struct Viewer<'a, P: webrtc::peer_connection::PeerConnection> {
     net: &'a net::Session<P>,
+    id: Option<u64>,
 }
 
 impl<'a, P: webrtc::peer_connection::PeerConnection> Viewer<'a, P> {
-    fn new(net: &'a net::Session<P>) -> Self {
-        Self { net }
+    fn new(net: &'a net::Session<P>, id: Option<u64>) -> Self {
+        Self { net, id }
     }
 }
 
@@ -916,15 +1297,13 @@ async fn run_media<P: webrtc::peer_connection::PeerConnection, N>(
     let mut said_no_video = false;
     let mut ticker = tokio::time::interval(Duration::from_millis(200));
     let mut control = tokio::time::interval(CONTROL_INTERVAL);
-    let mut was_paused = false;
 
     loop {
         tokio::select! {
             Some((au, ts)) = media.video_rx.recv() => {
-                // While paused the channels are still drained, so capture does
-                // not block behind a full queue, the frames are simply not
-                // sent, and the viewer holds the last picture it decoded.
-                if !session.paused() && !sabotage.should_drop() {
+                // Sent whether or not the picture is hidden: hiding changes
+                // what is encoded, see `card`, never whether it is sent.
+                if !sabotage.should_drop() {
                     let len = au.len();
                     // The frame duration follows whatever cadence the rate
                     // controller settled on, because it is what the RTP
@@ -943,15 +1322,13 @@ async fn run_media<P: webrtc::peer_connection::PeerConnection, N>(
                 }
             }
             Some(packet) = media.audio_rx.recv() => {
-                if !session.paused() {
-                    for viewer in viewers.iter() {
-                        let _ = viewer
-                            .net
-                            .send_audio(&packet.data, packet.timestamp_us, packet_duration)
-                            .await;
-                    }
-                    session.note_audio();
+                for viewer in viewers.iter() {
+                    let _ = viewer
+                        .net
+                        .send_audio(&packet.data, packet.timestamp_us, packet_duration)
+                        .await;
                 }
+                session.note_audio();
             }
             _ = control.tick() => {
                 // Everyone's feedback, reduced to the worst of it.
@@ -1000,22 +1377,19 @@ async fn run_media<P: webrtc::peer_connection::PeerConnection, N>(
                 // will never carry another frame, and without this the loop
                 // would keep encoding into it while the window said "live".
                 if !viewers.is_empty() && viewers.iter().all(|v| v.net.lost()) {
-                    break Served::Ended(Err("the viewer's connection dropped".to_owned()));
+                    break Served::Ended(Err(VIEWER_LEFT.to_owned()));
                 }
 
-                // Resuming needs a fresh refresh: every frame dropped while
-                // paused was a reference some later frame depends on.
-                let paused = session.paused();
-                if was_paused && !paused {
-                    media.resume_keyframe.request();
+                // Removed by the host. Ending here closes their connection,
+                // which their page sees as the stream stopping.
+                if viewers.iter().any(|v| v.id.is_some_and(|id| session.is_kicked(id))) {
+                    break Served::Ended(Ok(()));
                 }
-                was_paused = paused;
 
-                session.set_mic_peak(if media.microphone.is_on() {
-                    media.microphone.take_peak()
-                } else {
-                    0.0
-                });
+                // Measured whether or not the microphone is live, so the meter
+                // can say the right device is listening before anyone is
+                // heard through it.
+                session.set_mic_peak(media.microphone.take_peak());
             }
             else => break Served::Ended(Ok(())),
         }
@@ -1101,6 +1475,15 @@ fn video_loop(
     let mut scaler: Option<scale::Scaler> = None;
     let mut last_idr = Instant::now();
 
+    // What stands in for the picture while it is hidden, drawn at the size of
+    // whatever it replaces, and the last real frame, for putting back the
+    // moment it is shown again. Both belong to the capture's device, so they
+    // go whenever the capture does.
+    let mut cover: Option<(windows::Win32::Graphics::Direct3D11::ID3D11Texture2D, u32, u32)> = None;
+    let mut last_real: Option<(windows::Win32::Graphics::Direct3D11::ID3D11Texture2D, u32, u32)> =
+        None;
+    let mut was_hidden = false;
+
     // The target the encoder was last set to. Compared against rather than
     // asking the encoder every frame, so a driver that refuses a rate change
     // is not asked again until the controller actually wants something else.
@@ -1118,6 +1501,8 @@ fn video_loop(
                     // against the old capture's D3D11 device, so it goes
                     // first; replacing `cap` is what releases that device.
                     drop(enc.take());
+                    cover = None;
+                    last_real = None;
                     cap = Some(next);
                     announced = false;
                     ever_framed = false;
@@ -1173,6 +1558,8 @@ fn video_loop(
         // immediately, so that is what happens.
         if cap.is_some() && !ever_framed && opened_at.elapsed() >= CAPTURE_RETRY_AFTER {
             drop(enc.take());
+            cover = None;
+            last_real = None;
             cap = None;
             dims = (0, 0);
             pacer.reset();
@@ -1192,6 +1579,8 @@ fn video_loop(
                 // something new to show them.
                 session.note(format!("that window is gone ({e}) - pick another application"));
                 drop(enc.take());
+                cover = None;
+                last_real = None;
                 cap = None;
                 continue;
             }
@@ -1242,6 +1631,36 @@ fn video_loop(
         if fresh.is_some() {
             ever_framed = true;
         }
+
+        // Hidden: the card goes to the encoder in place of every frame, at
+        // that frame's size, and the switch in either direction is itself a
+        // frame, so a window that is not changing still shows the change.
+        //
+        // If the card cannot be made, nothing is sent rather than the real
+        // picture. Somebody who pressed hide wanted the picture gone, and a
+        // held frame is a worse outcome than a broken card but a far better
+        // one than what they were hiding.
+        let hidden = session.hidden();
+        let fresh = match fresh {
+            Some((texture, w, h)) => {
+                last_real = Some((texture.clone(), w, h));
+                if hidden {
+                    covering(&mut cover, source.device(), w, h, &session).map(|t| (t, w, h))
+                } else {
+                    Some((texture, w, h))
+                }
+            }
+            None if hidden != was_hidden && dims != (0, 0) => {
+                if hidden {
+                    covering(&mut cover, source.device(), dims.0, dims.1, &session)
+                        .map(|t| (t, dims.0, dims.1))
+                } else {
+                    last_real.clone()
+                }
+            }
+            None => None,
+        };
+        was_hidden = hidden;
 
         // Rebuild on any geometry change. Dropping the old session first
         // matters: consumer cards cap concurrent NVENC sessions, so holding
@@ -1308,6 +1727,31 @@ fn video_loop(
     Ok(())
 }
 
+/// The pause card at this size, made the first time it is needed at it.
+fn covering(
+    cover: &mut Option<(windows::Win32::Graphics::Direct3D11::ID3D11Texture2D, u32, u32)>,
+    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    w: u32,
+    h: u32,
+    session: &Session,
+) -> Option<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D> {
+    if let Some((texture, cw, ch)) = cover.as_ref()
+        && (*cw, *ch) == (w, h)
+    {
+        return Some(texture.clone());
+    }
+    match card::texture(device, w, h) {
+        Ok(texture) => {
+            *cover = Some((texture.clone(), w, h));
+            Some(texture)
+        }
+        Err(e) => {
+            session.note(e);
+            None
+        }
+    }
+}
+
 /// Best guess at the address a viewer on the same network should use.
 fn local_address() -> String {
     use std::net::UdpSocket;
@@ -1325,7 +1769,39 @@ fn local_address() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::describe_viewer;
+    use super::{benign, describe_viewer, split_about, About, NOBODY_YET, REFUSED};
+
+    #[test]
+    fn the_pages_own_lines_come_off_the_answer() {
+        let posted = "x-sideband-viewer:abc123\r\nx-sideband-device:Android, Chrome\r\nv=0\r\na=candidate:1 1 udp 1 203.0.113.9 5000 typ srflx\r\n";
+        let (about, sdp) = split_about(posted);
+        assert_eq!(about, About { browser: "abc123".into(), device: "Android, Chrome".into() });
+        assert!(sdp.starts_with("v=0"), "{sdp:?}");
+        assert!(!sdp.contains("x-sideband"));
+        assert_eq!(describe_viewer(&sdp), "203.0.113.9");
+    }
+
+    #[test]
+    fn an_answer_with_nothing_extra_is_left_as_it_was() {
+        let plain = "v=0\r\ns=-\r\n";
+        let (about, sdp) = split_about(plain);
+        assert_eq!(about, About::default());
+        assert_eq!(sdp, plain);
+    }
+
+    #[test]
+    fn what_a_page_says_about_itself_is_cleaned_and_kept_short() {
+        let posted = format!("x-sideband-device:{}\u{7}evil\r\nv=0\r\n", "x".repeat(100));
+        let (about, _) = split_about(&posted);
+        assert!(about.device.chars().count() <= 40);
+        assert!(!about.device.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn waiting_and_saying_no_are_not_failures() {
+        assert!(benign(NOBODY_YET) && benign(REFUSED));
+        assert!(!benign("could not publish to the relay: timeout"));
+    }
 
     #[test]
     fn the_public_address_is_preferred() {

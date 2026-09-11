@@ -21,10 +21,19 @@ class_name = "SignallingSession"
 name = "LIMITS"
 class_name = "RateLimiter"
 
+# Permanent links. Each one remembers which code is live under it.
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "Room"
+
 # SQLite-backed classes are the ones available on the free plan.
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["SignallingSession", "RateLimiter"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["Room"]
 
 [observability]
 enabled = true

@@ -91,6 +91,17 @@ pub struct App {
     mics_listed: Instant,
     /// Whether the microphone picker is open.
     choosing_mic: bool,
+    /// Whether the list of people watching is open.
+    showing_people: bool,
+    /// Whether the link is shown as a QR code, for a phone to scan.
+    showing_qr: bool,
+    /// Sounds on arrival, departure and hotkeys. Remembered.
+    sounds: bool,
+    /// This machine's permanent link name, re-read now and then because the
+    /// engine replaces it when a new link is asked for mid-session.
+    room: String,
+    /// How many were watching last frame, to notice somebody arriving.
+    last_watching: u32,
     session: Option<Arc<Session>>,
     rates: Rates,
     /// Whether the source list is expanded. Mirrored so the viewport is only
@@ -128,6 +139,11 @@ impl Default for App {
             mics: Vec::new(),
             mics_listed: Instant::now() - REFRESH_EVERY * 2,
             choosing_mic: false,
+            showing_people: false,
+            showing_qr: false,
+            sounds: settings.sounds,
+            room: String::new(),
+            last_watching: 0,
             session: None,
             rates: Rates::default(),
             picking: false,
@@ -209,6 +225,15 @@ impl App {
                 .collect();
         }
 
+        // The permanent link, made the first time there is a relay to put
+        // it on. Re-read on this timer rather than once, because a new link
+        // asked for mid-session is written by the engine, not by the window.
+        let mut settings = Settings::load_stored();
+        if !self.relay.trim().is_empty() && settings.ensure_room() {
+            settings.save();
+        }
+        self.room = settings.room;
+
         // A window that has closed should not stay selected.
         if let Some(pid) = self.selected {
             if !self.sources.iter().any(|s| s.pid == pid) {
@@ -235,15 +260,20 @@ impl App {
         if relay == self.saved_relay
             && self.auto_approve == self.saved_auto_approve
             && self.mic_device == self.saved_mic_device
+            && self.sounds == Settings::load_stored().sounds
         {
             return;
         }
-        Settings {
-            relay: relay.clone(),
-            auto_approve: self.auto_approve,
-            mic_device: self.mic_device.clone(),
-        }
-        .save();
+        // Read, changed and written back, rather than written from scratch:
+        // the file also holds things the window does not own, the permanent
+        // link above all, and writing only what the window knows about would
+        // quietly throw that away.
+        let mut settings = Settings::load_stored();
+        settings.relay = relay.clone();
+        settings.auto_approve = self.auto_approve;
+        settings.mic_device = self.mic_device.clone();
+        settings.sounds = self.sounds;
+        settings.save();
         self.saved_relay = relay;
         self.saved_auto_approve = self.auto_approve;
         self.saved_mic_device = self.mic_device.clone();
@@ -255,6 +285,7 @@ impl App {
 
         let session = Arc::new(Session::default());
         session.set_auto_approve(self.auto_approve);
+        session.set_sounds(self.sounds);
         self.session = Some(Arc::clone(&session));
         self.rates = Rates::default();
 
@@ -275,6 +306,46 @@ impl App {
             s.request_stop();
         }
         self.session = None;
+        self.showing_people = false;
+    }
+
+    /// The permanent link, which works whenever this machine is sharing, so it
+    /// can be sent before starting and bookmarked for next time.
+    fn permanent_link(&self) -> Option<String> {
+        let relay = self.relay.trim().trim_end_matches('/');
+        (!relay.is_empty() && !self.room.is_empty()).then(|| format!("{relay}/r/{}", self.room))
+    }
+
+    /// Whether a session through a relay is running, the only kind that can
+    /// change its link or lock its door.
+    fn relay_running(&self) -> bool {
+        self.session.as_ref().is_some_and(|s| {
+            !matches!(s.phase(), Phase::Idle | Phase::Failed(_) | Phase::Ended)
+                && s.share().is_some_and(|(code, _)| code.is_some())
+        })
+    }
+
+    /// Replaces the link, and the code with it, so the old ones stop working.
+    ///
+    /// Mid-session the engine does it, because the relay session belongs to
+    /// it. Between sessions there is no code, only the permanent link, and
+    /// that is replaced here and the old one retired on the relay in the
+    /// background.
+    fn new_link(&mut self) {
+        if self.relay_running() {
+            if let Some(s) = &self.session {
+                s.request_new_link();
+            }
+            return;
+        }
+        let mut settings = Settings::load_stored();
+        let (old_name, old_key) = (settings.room.clone(), settings.room_key.clone());
+        settings.new_room();
+        settings.save();
+        self.room = settings.room;
+
+        let relay = self.relay.trim().to_owned();
+        std::thread::spawn(move || stream::room_forget(&relay, &old_name, &old_key));
     }
 }
 
@@ -319,7 +390,7 @@ impl eframe::App for App {
         // honoured, the bottom edge drags freely and leaves a band of empty
         // background under the strip, because there is nothing below it to
         // reveal. Correcting the size each frame is what actually holds it.
-        let expanded = self.picking || self.choosing_mic;
+        let expanded = self.picking || self.choosing_mic || self.showing_people || self.showing_qr;
         let wanted_height = if expanded { HEIGHT_PICKING } else { HEIGHT_STRIP };
         let viewport = ui.ctx().viewport_rect();
         let mode_changed = expanded != self.was_picking;
@@ -351,6 +422,8 @@ impl eframe::App for App {
         if expanded && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.picking = false;
             self.choosing_mic = false;
+            self.showing_people = false;
+            self.showing_qr = false;
         }
 
         let phase = self.session.as_ref().map(|s| s.phase());
@@ -365,6 +438,18 @@ impl eframe::App for App {
                 0 => {}
                 pid => self.selected = Some(pid),
             }
+
+            // Somebody arrived. The engine plays a sound; this flashes the
+            // taskbar as well, for whoever glances at it rather than hears.
+            let watching = s.watching();
+            if watching > self.last_watching {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                    egui::UserAttentionType::Informational,
+                ));
+            }
+            self.last_watching = watching;
+        } else {
+            self.last_watching = 0;
         }
 
         ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 6.0);
@@ -402,8 +487,15 @@ impl App {
                     ui.label(RichText::new(what).color(MUTED).size(11.0));
                 }
                 Some(Phase::Waiting { .. }) => {
-                    ui.spinner();
-                    ui.label(RichText::new("waiting for a viewer").color(MUTED).size(11.0));
+                    if self.session.as_ref().is_some_and(|s| s.locked()) {
+                        status_dot(ui, ACCENT);
+                        ui.label(
+                            RichText::new("locked, nobody new can join").color(ACCENT).size(11.0),
+                        );
+                    } else {
+                        ui.spinner();
+                        ui.label(RichText::new("waiting for a viewer").color(MUTED).size(11.0));
+                    }
                 }
                 Some(Phase::Approving { .. }) => {
                     status_dot(ui, ACCENT);
@@ -415,8 +507,9 @@ impl App {
                     );
                 }
                 Some(Phase::Live) => {
-                    let paused = self.session.as_ref().is_some_and(|s| s.paused());
-                    let (text, colour) = if paused { ("paused", ACCENT) } else { ("live", GOOD) };
+                    let hidden = self.session.as_ref().is_some_and(|s| s.hidden());
+                    let (text, colour) =
+                        if hidden { ("picture hidden", ACCENT) } else { ("live", GOOD) };
                     status_dot(ui, colour);
                     ui.label(RichText::new(text).color(colour).size(11.0).strong());
                     if let Some(sess) = &self.session {
@@ -454,8 +547,12 @@ impl App {
             // that refused to be captured when it was picked. It expires on
             // its own; a permanent banner for a transient problem would be
             // worse than not saying anything.
-            if let Some(note) = self.session.as_ref().and_then(|s| s.notice()) {
-                ui.label(RichText::new(truncate(&note, 58)).color(BAD).size(11.0));
+            if let Some(s) = &self.session
+                && let Some(note) = s.notice()
+            {
+                // News, somebody arriving or leaving, is not drawn as a fault.
+                let colour = if s.notice_is_news() { GOOD } else { BAD };
+                ui.label(RichText::new(truncate(&note, 58)).color(colour).size(11.0));
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -509,6 +606,33 @@ impl App {
         } else if self.choosing_mic {
             ui.add_space(8.0);
             self.mic_list(ui);
+        } else if self.showing_people {
+            ui.add_space(8.0);
+            self.people_list(ui);
+        } else if self.showing_qr {
+            ui.add_space(8.0);
+            self.qr_panel(ui, phase);
+        }
+    }
+
+    /// Only one of the expanded panels at a time; opening one closes the rest.
+    fn open_panel(&mut self, which: Panel) {
+        let was = match which {
+            Panel::Sources => self.picking,
+            Panel::Mics => self.choosing_mic,
+            Panel::People => self.showing_people,
+            Panel::Qr => self.showing_qr,
+        };
+        self.picking = false;
+        self.choosing_mic = false;
+        self.showing_people = false;
+        self.showing_qr = false;
+        let now = !was;
+        match which {
+            Panel::Sources => self.picking = now,
+            Panel::Mics => self.choosing_mic = now,
+            Panel::People => self.showing_people = now,
+            Panel::Qr => self.showing_qr = now,
         }
     }
 
@@ -609,8 +733,7 @@ impl App {
         let texture = path.and_then(|p| self.icon(ui.ctx(), &p));
 
         if combo_field(ui, &label, chosen, self.picking, texture.as_ref()).clicked() {
-            self.picking = !self.picking;
-            self.choosing_mic = false;
+            self.open_panel(Panel::Sources);
         }
 
         let detail = if running {
@@ -651,11 +774,13 @@ impl App {
         // The header already says live, so while somebody is watching this
         // spot is better spent on the code than on repeating that, and the
         // heading carries how many have come in on it.
+        let locked = self.session.as_ref().is_some_and(|s| s.locked());
         let heading = match (&code, live) {
             (Some(_), true) => {
                 let n = self.session.as_ref().map_or(0, |s| s.watching());
-                format!("CODE · {n} WATCHING")
+                format!("CODE · {n} WATCHING{}", if locked { " · LOCKED" } else { "" })
             }
+            (Some(_), false) if locked => "CODE · LOCKED".to_owned(),
             (Some(_), false) => "CODE".to_owned(),
             (None, _) => "SESSION".to_owned(),
         };
@@ -707,11 +832,18 @@ impl App {
         caption(ui, "SEND THEM THIS LINK");
 
         let live = matches!(phase, Some(Phase::Live));
-        let link = self.shareable(phase).map(|(_, link)| link);
+        // What is on offer in the session, and otherwise the permanent link,
+        // which works whenever this machine is sharing and so is worth
+        // having on screen before starting as much as after.
+        let link = self
+            .shareable(phase)
+            .map(|(_, link)| link)
+            .or_else(|| self.permanent_link());
+        let relay_running = self.relay_running();
 
         match link {
             // Somebody is watching and more can join: the link stays, on one
-            // row with its copy button, so the meters below keep their place.
+            // row with its buttons, so the meters below keep their place.
             // Those meters are how anyone tells a quiet game from a broken
             // capture, and trading them for the link would only move the gap.
             Some(link) if live => {
@@ -719,7 +851,18 @@ impl App {
                     if tiny(ui, "copy link").clicked() {
                         ui.ctx().copy_text(link.clone());
                     }
-                    ui.label(RichText::new(shorten_url(&link)).color(INK).size(10.0).monospace());
+                    if tiny(ui, "qr").on_hover_text("show the link as a code for a phone").clicked() {
+                        self.open_panel(Panel::Qr);
+                    }
+                    if relay_running
+                        && tiny(ui, "viewers")
+                            .on_hover_text("who is watching, and removing them")
+                            .clicked()
+                    {
+                        self.open_panel(Panel::People);
+                    }
+                    ui.label(RichText::new(link_tail(&link)).color(INK).size(10.0).monospace())
+                        .on_hover_text(&link);
                 });
                 if let Some(sess) = self.session.clone() {
                     ui.add_space(4.0);
@@ -735,14 +878,23 @@ impl App {
                     if tiny(ui, "copy link").clicked() {
                         ui.ctx().copy_text(link.clone());
                     }
+                    if tiny(ui, "qr").on_hover_text("show the link as a code for a phone").clicked() {
+                        self.open_panel(Panel::Qr);
+                    }
+                    if relay_running && tiny(ui, "viewers").clicked() {
+                        self.open_panel(Panel::People);
+                    }
                     ui.label(
                         RichText::new(if self.relay.trim().is_empty() {
                             "same network only"
+                        } else if is_permanent(&link) {
+                            // The same link every time: it finds whatever this
+                            // machine is sharing, and waits when it is not.
+                            "works every time you share"
                         } else {
-                            // Not a countdown any more: every new offer the
-                            // host publishes restarts the relay's clock, so
-                            // the code works for exactly as long as this is
-                            // sharing.
+                            // Every new offer the host publishes restarts the
+                            // relay's clock, so the code works for exactly as
+                            // long as this is sharing.
                             "works while you share"
                         })
                         .color(FAINT)
@@ -778,7 +930,7 @@ impl App {
             let mic_on = session.as_ref().is_some_and(|s| s.mic_on());
             let mic_ok = session.as_ref().is_some_and(|s| s.mic_available());
             if pill(ui, "mic", mic_on, live && mic_ok)
-                .on_hover_text(format!("microphone - {}", hotkey::DESCRIPTION))
+                .on_hover_text(format!("microphone - {}", hotkey::MIC_KEY))
                 .clicked()
             {
                 if let Some(s) = &session {
@@ -811,21 +963,25 @@ impl App {
                 .on_hover_text("choose which microphone to use")
                 .clicked()
             {
-                self.choosing_mic = !self.choosing_mic;
-                self.picking = false;
+                self.open_panel(Panel::Mics);
                 if self.choosing_mic {
                     self.mics = mic::devices();
                     self.mics_listed = Instant::now();
                 }
             }
 
-            let paused = session.as_ref().is_some_and(|s| s.paused());
-            if pill(ui, if paused { "resume" } else { "pause" }, paused, live)
-                .on_hover_text("hold the picture without dropping the viewer")
+            // Covers the picture with a pause card; sound carries on. For the
+            // moment something private is about to be on screen.
+            let hidden = session.as_ref().is_some_and(|s| s.hidden());
+            if pill(ui, if hidden { "show" } else { "hide" }, hidden, live)
+                .on_hover_text(format!(
+                    "cover the picture with a pause card, sound carries on - {}",
+                    hotkey::HIDE_KEY
+                ))
                 .clicked()
             {
                 if let Some(s) = &session {
-                    s.toggle_pause();
+                    s.toggle_hidden();
                 }
             }
 
@@ -848,7 +1004,159 @@ impl App {
     }
 }
 
+/// The panels that open below the strip.
+#[derive(Clone, Copy)]
+enum Panel {
+    Sources,
+    Mics,
+    People,
+    Qr,
+}
+
+/// Whether a link is the permanent kind, `relay/r/name`, rather than one made
+/// from this session's code.
+fn is_permanent(link: &str) -> bool {
+    link.contains("/r/")
+}
+
 impl App {
+    /// Who is watching, and the controls that decide who else may.
+    fn people_list(&mut self, ui: &mut egui::Ui) {
+        let Some(session) = self.session.clone() else {
+            self.showing_people = false;
+            return;
+        };
+        let mut new_link = false;
+
+        egui::Frame::new()
+            .fill(SURFACE)
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::same(10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    caption(ui, &format!("WATCHING · {}", session.watching()));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if pill(ui, "sounds", self.sounds, true)
+                            .on_hover_text("a sound when somebody joins or leaves, and on hotkeys")
+                            .clicked()
+                        {
+                            self.sounds = !self.sounds;
+                            session.set_sounds(self.sounds);
+                            self.remember();
+                        }
+                        if pill(ui, "new link", false, true)
+                            .on_hover_text(
+                                "replace the link and the code. The old ones stop working;\n\
+                                 everyone already watching stays.",
+                            )
+                            .clicked()
+                        {
+                            new_link = true;
+                        }
+                        let locked = session.locked();
+                        if pill(ui, if locked { "locked" } else { "lock" }, locked, true)
+                            .on_hover_text(
+                                "stop anyone new from joining. Everyone watching stays,\n\
+                                 and people opening the link are told to wait.",
+                            )
+                            .clicked()
+                        {
+                            session.set_locked(!locked);
+                        }
+                    });
+                });
+
+                // Whether viewers who cannot reach this machine on their own,
+                // phones on mobile data above all, have a way in.
+                if let Some((ok, why)) = session.reach() {
+                    ui.label(
+                        RichText::new(truncate(&why, 110))
+                            .color(if ok { FAINT } else { ACCENT })
+                            .size(10.0),
+                    );
+                }
+                ui.add_space(6.0);
+
+                let viewers = session.viewers();
+                if viewers.is_empty() {
+                    ui.label(RichText::new("nobody yet").color(MUTED).size(11.0));
+                    return;
+                }
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.style_mut().spacing.item_spacing.y = 3.0;
+                    for v in &viewers {
+                        if viewer_row(ui, v) {
+                            session.kick(v.id);
+                        }
+                    }
+                });
+            });
+
+        if new_link {
+            self.new_link();
+        }
+    }
+
+    /// The link, large, as a QR code a phone camera can open directly.
+    fn qr_panel(&mut self, ui: &mut egui::Ui, phase: Option<&Phase>) {
+        let link = self
+            .shareable(phase)
+            .map(|(_, link)| link)
+            .or_else(|| self.permanent_link());
+        let mut new_link = false;
+
+        egui::Frame::new()
+            .fill(SURFACE)
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::same(12))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let Some(link) = link.clone() else {
+                    ui.label(
+                        RichText::new("enter a relay above to get a link").color(MUTED).size(11.0),
+                    );
+                    return;
+                };
+                ui.horizontal_top(|ui| {
+                    let side = (ui.available_height() - 4.0).clamp(120.0, 240.0);
+                    paint_qr(ui, &link, side);
+                    ui.add_space(14.0);
+                    ui.vertical(|ui| {
+                        caption(ui, "POINT A PHONE'S CAMERA AT THIS");
+                        ui.label(RichText::new(&link).color(INK).size(12.0).monospace());
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(if is_permanent(&link) {
+                                "The same link every time you share. Bookmark it once, and it\n\
+                                 starts by itself whenever you go live."
+                            } else {
+                                "Works while this session is running."
+                            })
+                            .color(FAINT)
+                            .size(10.0),
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if tiny(ui, "copy link").clicked() {
+                                ui.ctx().copy_text(link.clone());
+                            }
+                            if tiny(ui, "new link")
+                                .on_hover_text("replace it. The old link stops working.")
+                                .clicked()
+                            {
+                                new_link = true;
+                            }
+                        });
+                    });
+                });
+            });
+
+        if new_link {
+            self.new_link();
+        }
+    }
+
     /// The capture devices, shown while the microphone picker is open.
     ///
     /// Offered because the system default is often wrong on a machine with a
@@ -1175,10 +1483,32 @@ fn masked(code: &str, visible: bool) -> String {
     }
 }
 
-/// Drops the scheme so a long relay URL still fits beside the code.
+/// Drops the scheme so a long relay URL still fits beside the code, and
+/// when that is not enough, shortens the host rather than the path: the path
+/// is the part that tells one link from another, and a link cut off before it
+/// looks identical to every other.
 fn shorten_url(url: &str) -> String {
+    const MAX: usize = 36;
     let bare = url.trim_start_matches("https://").trim_start_matches("http://");
-    truncate(bare, 32)
+    if bare.chars().count() <= MAX {
+        return bare.to_owned();
+    }
+    match bare.split_once('/') {
+        Some((host, path)) if path.chars().count() + 8 < MAX => {
+            let keep = MAX - path.chars().count() - 2;
+            format!("{}…/{path}", host.chars().take(keep).collect::<String>())
+        }
+        _ => truncate(bare, MAX),
+    }
+}
+
+/// Just the end of a link, for the row that has room for little else.
+fn link_tail(url: &str) -> String {
+    let bare = url.trim_start_matches("https://").trim_start_matches("http://");
+    match bare.split_once('/') {
+        Some((_, path)) => format!("…/{path}"),
+        None => bare.to_owned(),
+    }
 }
 
 /// One row of the expanded list, drawn by hand so the text can be left-aligned
@@ -1307,6 +1637,83 @@ fn meter_bar(ui: &mut egui::Ui, peak: f32, width: f32) {
     }
 }
 
+/// One person watching. Returns true when "remove" was pressed.
+fn viewer_row(ui: &mut egui::Ui, v: &crate::session::ViewerInfo) -> bool {
+    let mut removed = false;
+    egui::Frame::new()
+        .fill(BG)
+        .corner_radius(egui::CornerRadius::same(3))
+        .inner_margin(egui::Margin::symmetric(10, 5))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(truncate(&v.describe(), 60)).color(INK).size(12.0));
+                ui.label(RichText::new(watched_for(v.since.elapsed())).color(FAINT).size(10.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("remove").size(10.0).color(BAD))
+                                .fill(SURFACE_HI)
+                                .corner_radius(egui::CornerRadius::same(3))
+                                .stroke(egui::Stroke::new(1.0, LINE)),
+                        )
+                        .on_hover_text("disconnect them, and keep them out until you stop sharing")
+                        .clicked()
+                    {
+                        removed = true;
+                    }
+                });
+            });
+        });
+    removed
+}
+
+/// "3 min", "1 h 20 min". Whole minutes: a list that ticks every second is a
+/// list that is hard to read.
+fn watched_for(d: Duration) -> String {
+    let mins = d.as_secs() / 60;
+    match mins {
+        0 => "just joined".to_owned(),
+        m if m < 60 => format!("{m} min"),
+        m => format!("{} h {} min", m / 60, m % 60),
+    }
+}
+
+/// A QR code, painted module by module, dark on white with the quiet margin
+/// scanners need around it. Whole pixels per module, or the edges blur and a
+/// camera struggles.
+fn paint_qr(ui: &mut egui::Ui, text: &str, side: f32) {
+    let Ok(code) = qrcode::QrCode::new(text.as_bytes()) else { return };
+    let n = code.width();
+    let colors = code.to_colors();
+    const QUIET: usize = 4;
+    let total = n + QUIET * 2;
+    let module = (side / total as f32).floor().max(1.0);
+    let size = module * total as f32;
+
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let origin = rect.min.round();
+    let painter = ui.painter();
+    painter.rect_filled(
+        egui::Rect::from_min_size(origin, egui::vec2(size, size)),
+        egui::CornerRadius::same(4),
+        Color32::WHITE,
+    );
+    for y in 0..n {
+        for x in 0..n {
+            if colors[y * n + x] == qrcode::Color::Dark {
+                let at = origin
+                    + egui::vec2((x + QUIET) as f32 * module, (y + QUIET) as f32 * module);
+                painter.rect_filled(
+                    egui::Rect::from_min_size(at, egui::vec2(module, module)),
+                    egui::CornerRadius::ZERO,
+                    Color32::BLACK,
+                );
+            }
+        }
+    }
+}
+
 fn mic_row(ui: &mut egui::Ui, name: &str, note: &str, selected: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), 30.0),
@@ -1363,7 +1770,38 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{masked, shorten_url, spaced, truncate};
+    use super::{is_permanent, masked, shorten_url, spaced, truncate, watched_for};
+    use std::time::Duration;
+
+    #[test]
+    fn a_long_link_keeps_the_part_that_tells_it_apart() {
+        let out = shorten_url("https://sideband.example.workers.dev/r/abcdefghjkmn");
+        assert!(out.ends_with("/r/abcdefghjkmn"), "{out}");
+        assert!(out.starts_with("sideband."), "{out}");
+        assert!(out.chars().count() <= 36, "{out}");
+        assert_eq!(super::link_tail("https://x.example/r/abc"), "…/r/abc");
+    }
+
+    #[test]
+    fn permanent_links_are_told_apart_from_code_links() {
+        assert!(is_permanent("https://relay.example/r/abcdefghjkmn"));
+        assert!(!is_permanent("https://relay.example/ABC234"));
+    }
+
+    #[test]
+    fn time_watched_reads_in_whole_minutes() {
+        assert_eq!(watched_for(Duration::from_secs(20)), "just joined");
+        assert_eq!(watched_for(Duration::from_secs(185)), "3 min");
+        assert_eq!(watched_for(Duration::from_secs(80 * 60)), "1 h 20 min");
+    }
+
+    #[test]
+    fn a_link_makes_a_scannable_code() {
+        // The longest link this will ever show, give or take a relay name.
+        let link = "https://sideband.someone-long.workers.dev/r/abcdefghjkmn";
+        let code = qrcode::QrCode::new(link.as_bytes()).expect("fits in a QR code");
+        assert!(code.width() <= 41, "small enough to scan from a screen, width {}", code.width());
+    }
 
     #[test]
     fn hidden_codes_reveal_nothing_but_keep_their_width() {

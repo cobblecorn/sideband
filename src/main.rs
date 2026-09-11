@@ -14,6 +14,8 @@
 mod audio;
 mod bwe;
 mod capture;
+mod card;
+mod chime;
 mod encoder;
 mod gain;
 mod gui;
@@ -24,6 +26,7 @@ mod mark;
 mod mic;
 mod net;
 mod pipeline;
+mod portmap;
 mod server;
 mod scale;
 mod session;
@@ -240,6 +243,26 @@ fn run() -> Result<(), String> {
             listen(which, secs)
         }
 
+        // Whether the router will open ports for viewers, asked without
+        // opening any. The answer to "will a phone on mobile data get in".
+        "router" => {
+            let local = net::local_ip().ok_or("this machine has no network route")?;
+            println!("\n  looking for the router from {local}…");
+            match portmap::Router::find(local) {
+                Ok(router) => {
+                    println!("  It answered, and its public address is {}.", router.external());
+                    println!("  Sideband will open a port on it for each viewer while they watch,");
+                    println!("  so phones on mobile data can connect.\n");
+                }
+                Err(why) => {
+                    println!("  {why}.\n");
+                    println!("  Viewers on the same network, and most others, still connect.");
+                    println!("  Phones on mobile data may not, unless the relay has TURN set up.\n");
+                }
+            }
+            Ok(())
+        }
+
         "window" if args.len() == 3 => capture_window(parse_pid(&args[1])?, parse_secs(&args[2])?),
         "encode" if args.len() == 3 => encode_window(parse_pid(&args[1])?, parse_secs(&args[2])?),
 
@@ -298,6 +321,7 @@ const USAGE: &str = "  sideband                      pick a window and share it
   sideband share  [pid] [relay] pair by code through a relay
   sideband stream [pid] [port]  serve the viewer page yourself
 
+  sideband router               check whether the router will let phones in
   sideband mics                 list the microphones it can use
   sideband mic  [secs] [n]      listen to one and show the level
   sideband audio  <pid> <secs>  record that app's audio to a WAV
@@ -305,6 +329,7 @@ const USAGE: &str = "  sideband                      pick a window and share it
   sideband encode <pid> <secs>  encode to out.h264
 
   Ctrl+Alt+M toggles the microphone while streaming.
+  Ctrl+Alt+H hides the picture behind a pause card, and shows it again.
   While streaming, Enter lists applications and a number switches to one.
   Set SIDEBAND_RELAY to your Worker URL to share by code by default.";
 
@@ -334,7 +359,7 @@ fn stdin_lines() -> std::sync::mpsc::Receiver<String> {
 /// often exactly that. This is how you find out which one hears you.
 fn listen(device: Option<String>, seconds: f64) -> Result<(), String> {
     let stop = Arc::new(AtomicBool::new(false));
-    let microphone = mic::Mic::start_on(device, Arc::clone(&stop));
+    let microphone = mic::Mic::start_on(device, Arc::clone(&stop), Arc::new(AtomicBool::new(false)));
 
     if !microphone.available() {
         stop.store(true, Ordering::Relaxed);
@@ -387,6 +412,77 @@ fn print_sources(list: &[sources::Source]) {
 ");
 }
 
+/// One line typed while sharing.
+///
+/// Everything the window's buttons do, for whoever is sharing from a terminal:
+/// a number switches application, and a letter does the rest. Anything else
+/// lists both.
+fn command(line: &str, session: &Session, listed: &mut Vec<sources::Source>) {
+    let mut words = line.split_whitespace();
+    match (words.next().unwrap_or(""), words.next()) {
+        ("h", None) => {
+            if session.toggle_hidden() {
+                println!("  Picture hidden. Viewers see a pause card; sound carries on.\n");
+            } else {
+                println!("  Picture showing again.\n");
+            }
+        }
+        ("l", None) => {
+            let now = !session.locked();
+            session.set_locked(now);
+            if now {
+                println!("  Locked. Nobody new can join; everyone watching stays.\n");
+            } else {
+                println!("  Unlocked. The link lets people in again.\n");
+            }
+        }
+        ("q", None) => {
+            println!("  Stopping.\n");
+            session.request_stop();
+        }
+        ("n", None) => {
+            session.request_new_link();
+            println!("  Making a new link and code. The old ones will stop working.\n");
+        }
+        ("v", None) => {
+            let viewers = session.viewers();
+            if viewers.is_empty() {
+                println!("  Nobody is watching.\n");
+            }
+            for (i, v) in viewers.iter().enumerate() {
+                println!("  {:>3}  {}  ({} min)", i + 1, v.describe(), v.since.elapsed().as_secs() / 60);
+            }
+            if !viewers.is_empty() {
+                println!("\n  Type x and a number to remove somebody.\n");
+            }
+        }
+        ("x", Some(n)) => {
+            let viewers = session.viewers();
+            match n.parse::<usize>().ok().and_then(|n| viewers.get(n.wrapping_sub(1))) {
+                Some(v) => {
+                    session.kick(v.id);
+                    println!("  Removing {}. They cannot come back this session.\n", v.describe());
+                }
+                None => println!("  No viewer with that number. Type v for the list.\n"),
+            }
+        }
+        _ => match line.parse::<usize>() {
+            Ok(n) if n >= 1 && n <= listed.len() => {
+                let picked = &listed[n - 1];
+                println!("  Now sharing {} (pid {}).\n", picked.exe, picked.pid);
+                session.select_source(picked.pid);
+            }
+            _ => {
+                *listed = sources::list().unwrap_or_default();
+                print_sources(listed);
+                println!("  h  hide or show the picture     l  lock or unlock");
+                println!("  v  who is watching              x N  remove viewer N");
+                println!("  n  new link and code            q  stop sharing\n");
+            }
+        },
+    }
+}
+
 /// Runs a streaming session with a terminal read-out of its progress. The GUI
 /// reads the same `Session`; this is only a different way of drawing it.
 fn with_progress<F>(body: F) -> Result<(), String>
@@ -397,7 +493,9 @@ where
     // One setting, however it was turned on. Someone who ticked the box in the
     // window and then ran the command line would otherwise be asked to approve
     // a viewer by a prompt they had already said they did not want.
-    session.set_auto_approve(settings::Settings::load().auto_approve);
+    let remembered = settings::Settings::load();
+    session.set_auto_approve(remembered.auto_approve);
+    session.set_sounds(remembered.sounds);
     let input = stdin_lines();
 
     let printer = {
@@ -412,6 +510,8 @@ where
             // A notice stays readable for several seconds so a window can
             // draw it; a terminal prints it once.
             let mut said: Option<String> = None;
+            // The code and link last printed, to notice them changing.
+            let mut shown: Option<(Option<String>, String)> = None;
             loop {
                 let phase = session.phase();
                 if Some(&phase) != last.as_ref() {
@@ -452,8 +552,7 @@ where
                         }
                         Phase::Live => {
                             println!("  Viewer connected.");
-                            println!("  Press Enter for the application list, or a number to switch.
-");
+                            println!("  Press Enter for the application list and what can be typed.\n");
                         }
                         Phase::Failed(why) => println!("
   Failed: {why}
@@ -472,28 +571,31 @@ where
 
                 // Whatever has been typed since the last pass. Swapping the
                 // shared application does not touch the connection, so there
-                // is no reason to make someone stop and start again for it.
-                if matches!(phase, Phase::Live) {
+                // is no reason to make someone stop and start again for it,
+                // and the same goes for everything else that can be typed.
+                if matches!(phase, Phase::Live | Phase::Waiting { .. }) {
                     while let Ok(line) = input.try_recv() {
-                        let line = line.trim().to_owned();
-                        match line.parse::<usize>() {
-                            Ok(n) if n >= 1 && n <= listed.len() => {
-                                let picked = &listed[n - 1];
-                                println!("  Now sharing {} (pid {}).
-", picked.exe, picked.pid);
-                                session.select_source(picked.pid);
-                            }
-                            _ => {
-                                listed = sources::list().unwrap_or_default();
-                                print_sources(&listed);
-                            }
-                        }
+                        command(line.trim(), &session, &mut listed);
                     }
+
+                    // A new link asked for mid-session arrives without a
+                    // change of phase, so it is looked for separately.
+                    let offered = session.share();
+                    if offered != shown
+                        && matches!(phase, Phase::Live)
+                        && shown.is_some()
+                        && let Some((code, link)) = &offered
+                    {
+                        if let Some(code) = code {
+                            println!("  Code   {code}");
+                        }
+                        println!("  Link   {link}\n");
+                    }
+                    shown = offered;
 
                     let note = session.notice();
                     if note.is_some() && note != said {
-                        println!("  {}
-", note.as_deref().unwrap_or_default());
+                        println!("  {}\n", note.as_deref().unwrap_or_default());
                     }
                     said = note;
                 }
@@ -527,7 +629,12 @@ where
                             }
                             None => String::new(),
                         };
-                        println!("  {frames} video / {packets} audio sent{quality}{app}{mic}");
+                        let hidden = if session.hidden() { "  HIDDEN" } else { "" };
+                        let people = match session.watching() {
+                            0 | 1 => String::new(),
+                            n => format!("  {n} watching"),
+                        };
+                        println!("  {frames} video / {packets} audio sent{quality}{app}{mic}{hidden}{people}");
                     }
                 }
 

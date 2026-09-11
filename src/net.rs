@@ -65,17 +65,24 @@ use crate::bwe::{Feedback, FeedbackWatcher, ViewerFeedback};
 /// sent to find it out: connecting a UDP socket only asks the kernel which
 /// local interface would carry a packet to the outside world.
 fn local_bind() -> String {
-    use std::net::UdpSocket;
-
-    UdpSocket::bind("0.0.0.0:0")
-        .and_then(|s| {
-            s.connect("8.8.8.8:80")?;
-            s.local_addr()
-        })
-        .map(|a| format!("{}:0", a.ip()))
+    match local_ip() {
+        Some(ip) => format!("{ip}:0"),
         // No route at all, which is a machine with no network rather than a
         // machine with too many. Everything is the best guess left.
-        .unwrap_or_else(|_| "0.0.0.0:0".to_owned())
+        None => "0.0.0.0:0".to_owned(),
+    }
+}
+
+/// The address of the interface that leads to the internet, see `local_bind`.
+pub fn local_ip() -> Option<std::net::Ipv4Addr> {
+    use std::net::{IpAddr, UdpSocket};
+
+    let s = UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("8.8.8.8:80").ok()?;
+    match s.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) => Some(ip),
+        IpAddr::V6(_) => None,
+    }
 }
 
 /// How long to wait for ICE gathering before sending what we have.

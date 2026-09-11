@@ -146,8 +146,11 @@ impl Mic {
     /// with `available: false` rather than an error if there is no device,
     /// a missing microphone should not stop someone sharing their screen.
     /// Opens `wanted` if it is still there, and the default otherwise.
-    pub fn start_on(wanted: Option<String>, stop: Arc<AtomicBool>) -> Self {
-        let enabled = Arc::new(AtomicBool::new(false));
+    ///
+    /// `enabled` is the on switch, handed in rather than made here, so that
+    /// whatever owns the session owns the switch: a button, a hotkey and one
+    /// microphone per viewer all have to agree on whether it is on.
+    pub fn start_on(wanted: Option<String>, stop: Arc<AtomicBool>, enabled: Arc<AtomicBool>) -> Self {
         let buffer = Arc::new(Mutex::new(VecDeque::new()));
         let peak = Arc::new(AtomicU32::new(0));
 
@@ -195,10 +198,6 @@ impl Mic {
 
     pub fn is_on(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
-    }
-
-    pub fn handle(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.enabled)
     }
 
     /// Loudest sample captured since the last call, 0.0 to 1.0, and resets.

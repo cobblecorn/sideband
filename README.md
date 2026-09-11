@@ -72,13 +72,51 @@ moment the window is restored.
 Open Sideband, pick an application, press start. You get a link, and a six-character
 code if you're going through a relay. Send either one.
 
+**The link is permanent.** Going through a relay, the link looks like
+`https://your-relay/r/k6qcy68uka45` and it is the same every time you share. It is
+on screen before you press start, so it can be sent ahead of time, and a page
+left open on it starts the stream by itself whenever you go live, and goes back
+to waiting when you stop. Bookmark it once and nobody has to send anybody a new
+link again. The code still works on its own, for reading out over a call.
+
+**qr** shows the link as a QR code, for a phone to open with its camera.
+
+**viewers** lists who is watching, by device and address, with how long they have
+been there. From there:
+
+- **remove** disconnects somebody and keeps them out until you stop sharing.
+- **lock** stops anyone new from joining. Everybody watching stays, and anyone
+  opening the link is told you are not letting people in right now, and gets in
+  by themselves when you unlock.
+- **new link** replaces the link and the code, and the old ones stop working at
+  once. For a link that has travelled further than you meant it to. Everybody
+  already watching stays; remove is for them.
+- **sounds** turns off the chime played when somebody joins or leaves.
+
+**Hide** - **Ctrl+Alt+H**, or the **hide** button, covers the picture with a
+pause card, for the moment a login box or a private message is about to be on
+screen. Sound carries on. Press it again to show the picture. The viewer never
+reconnects and the stream never stops: the card is encoded like any other frame,
+so there is nothing to recover from when the picture comes back. A short sound
+tells you which way it went, because you will be looking at a game rather than at
+the window.
+
+**On a phone** - the page keeps the screen awake while the stream is on it, and if
+the phone refuses to start the video with sound, the picture starts anyway with a
+**Tap for sound** button over it.
+
 There is a command line too, driving the same engine:
 
 ```
 sideband                      pick a window and share it
 sideband share  [pid] [relay] pair by code through a relay
 sideband stream [pid] [port]  serve the viewer page yourself
+sideband router               check whether the router will let phones in
 ```
+
+While sharing from a terminal, **h** hides the picture, **l** locks, **v** lists
+who is watching, **x 2** removes viewer 2, **n** makes a new link, **q** stops, and
+a number switches application. Enter on its own lists all of it.
 
 **On a LAN or a tailnet you need no relay at all.** `sideband stream` serves its
 own viewer page and nothing external is involved.
@@ -95,7 +133,7 @@ thing between them and your screen, so it is a per-machine choice and it is
 remembered.
 
 **Microphone** - off by default. **Ctrl+Alt+M** toggles it globally, so it works
-without leaving the game. Pick which one with **mic device**; the level meter runs
+without leaving the game, with a short high or low tone for on and off. Pick which one with **mic device**; the level meter runs
 whether or not the mic is live, so you can confirm you chose the right one without
 going live first.
 
@@ -122,37 +160,14 @@ and 30 fps, low enough for almost any home link to carry from the first frame, a
 climbs to 1080p60 at 10 Mbit/s over the next ten to twenty seconds if the viewer
 keeps reporting a clean path. If they stop, it comes back down quickly.
 
-Bitrate and frame rate move continuously. The **picture size barely moves at
-all**. It is chosen about ten seconds in, and after that it will improve if the
-connection genuinely improves, and fall back if it genuinely collapses, but
-nothing else will shift it.
+Bitrate and frame rate move continuously. **The picture size never changes on
+its own**: it is always the size of the window being shared. It used to shrink on
+a slow connection, and a picture that resizes itself in the viewer's window turned
+out to be far worse to watch than one that is a little soft.
 
-That asymmetry is deliberate. A bitrate change is invisible and a frame rate
-change nearly so, but a resolution change resizes the picture in the viewer's
-window. A slightly soft picture is something you stop noticing after a minute;
-one that keeps resizing is not.
-
-So the size is not asked "where is the rate now", which is a question that
-changes every second by design. It is asked "what has every one of the last
-thirty seconds supported", and it may not answer twice inside a minute. A rate
-wandering across a threshold produces disagreement and nothing happens. Only a
-connection that has actually changed can make thirty consecutive seconds agree.
-
-It also asks whether anything went wrong before shrinking. A low rate does not
-mean a slow connection: the rate is capped by what the encoder actually spent,
-and a still window spends almost nothing, so a browser sitting on a page looks
-exactly like a struggling link. Shrinking needs the far end to have complained,
-by loss or by asking for less. On a healthy connection the picture stays full
-size however cheap the content is.
-
-The one decision is worth making, though: a full sized 1080p picture at half a
-megabit is about twelve thousandths of a bit per pixel, which never freezes and
-never stutters, it simply arrives as mush. Quartering each dimension buys sixteen
-times as many bits per pixel for the same bandwidth, and the viewer's browser
-scales it back up to fill their window.
-
-**To fix the size yourself** and have it never change at all, not even once, set
-`SIDEBAND_SCALE` to 1, 2 or 4, for full, half or quarter.
+**To send a smaller picture** anyway, on a connection that really cannot carry
+full size, set `SIDEBAND_SCALE` to 2 or 4, for half or quarter. The viewer's
+browser scales it back up to fill their window.
 
 **If you want to cap what it uses**, set `SIDEBAND_MAX_BITRATE` to a number of
 kbit/s. Everything above still applies underneath it; this only lowers the
@@ -291,7 +306,26 @@ export SIDEBAND_TURN_PASS=...
 ```
 
 Without it, connections fall back to STUN only. Most work; the ones behind CGNAT
-will not.
+need the next section.
+
+### Or let the router open the door
+
+Most home routers let a program ask them to forward a port, through UPnP, and
+Sideband asks. For each viewer it forwards the one port that viewer's connection
+is listening on, for as long as they are watching, adds your router's public
+address to the offer as one more place to connect, and closes the port again when
+they leave. A phone on mobile data then has somewhere to connect to, which is the
+whole of what it was missing. Nothing is configured by hand and nothing is paid
+for, and when it works it makes TURN unnecessary.
+
+What is behind the port is a WebRTC connection, which answers nothing that does
+not carry the credentials from that viewer's offer.
+
+`sideband router` checks whether yours will do it, without opening anything.
+**viewers** in the window says the same while you share. It cannot help when your
+internet provider puts your whole router behind a shared address, which some do;
+that is detected and said. Turn it off with `open_ports = false` in
+`%APPDATA%\Sideband\settings`, or `SIDEBAND_NO_UPNP=1` for one run.
 
 See [worker/README.md](worker/README.md) for the protocol and the threat model.
 
@@ -299,13 +333,19 @@ See [worker/README.md](worker/README.md) for the protocol and the threat model.
 
 ## Who can watch
 
-A session can be claimed **once**. As soon as someone is watching, the code is dead
-and the relay has already forgotten the session, so a third party who later learns
-the code gets nothing.
+Whoever has the link or the code, while you are sharing. Both keep working for
+everybody for as long as the session runs, so a second person, or the same person
+on a second device, is let in the same way as the first.
 
-Knowing the code is not enough on its own either. The host is shown where the
-request came from and has to allow it before any video flows; an unanswered prompt
-counts as a refusal.
+Knowing either is not enough on its own unless you say so. The host is shown the
+device and the address each request came from and has to allow it before any
+video flows; turning somebody away keeps them out for the rest of the session.
+**Auto admit** skips the prompt, for when you are the one at the other end.
+
+After that it is yours to manage: **lock** to let nobody else in, **remove** for
+somebody who should not be there, and **new link** when the link itself has got
+out. The permanent link is twelve random characters, which is the part nobody
+can guess, and the key that updates it never leaves your machine and the relay.
 
 The link on a local network carries a 128-bit secret too. Being on the same Wi-Fi is
 not consent to watch someone's screen, so every route checks it and anything without
@@ -369,6 +409,7 @@ wide and would fringe rather than read.
 Each isolates one stage, which is how most of the bugs in this were found:
 
 ```
+sideband router               whether the router will open ports, opening none
 sideband mics                 list the capture devices it can use
 sideband mic  [secs] [n]      listen to one and watch the level
 sideband audio  <pid> <secs>  that app's audio to a WAV, plus Opus stats
@@ -409,10 +450,12 @@ cargo test
   purpose, sustained: every surviving frame decoded, no freezes, and no picture
   requests. The visible cost is a faint band sweeping the picture once after
   heavy loss.
-- **Resolution is powers of two, and settles once.** Full, half or quarter of the
-  source window, decided about ten seconds in and then fixed. Anything in between
-  would need a scaler with a shader in it rather than mipmap generation, for a
-  difference nobody watching would notice.
+- **Resolution is the window's own, unless you set it.** `SIDEBAND_SCALE` gives
+  half or quarter; anything in between would need a scaler with a shader in it
+  rather than mipmap generation, for a difference nobody watching would notice.
+- **Removing somebody is by browser.** Their page keeps a random name in its
+  browser storage, and that is what is kept out. A private window is a new name,
+  which is what **new link** is for.
 - **Packaged ("Store") applications may have no capturable audio.** Their window
   belongs to `ApplicationFrameHost.exe` while the application runs in a separate
   process that is not below it, so audio scoped to the window's process tree
