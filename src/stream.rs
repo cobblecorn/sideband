@@ -169,7 +169,7 @@ async fn serve_local(pid: u32, port: u16, session: Arc<Session>) -> Result<(), S
                 answer = answer_rx.recv() => break answer.ok_or("signalling closed")?,
                 _ = hint.tick() => {
                     session.note(
-                        "nobody has reached this machine yet. If they are on your network,                          Windows Firewall may be blocking Sideband: run install.ps1 from an                          administrator PowerShell to add the rule."
+                        "nobody has reached this machine yet. If they are on your network, Windows Firewall may be blocking Sideband: run install.ps1 again and say yes to the Windows prompt."
                             .to_owned(),
                     );
                 }
@@ -189,7 +189,7 @@ async fn serve_local(pid: u32, port: u16, session: Arc<Session>) -> Result<(), S
                 Decision::Refused => return Err("you turned that viewer away".into()),
                 Decision::Unanswered => {
                     session.note(
-                        "nobody answered the prompt here, so that viewer was not let in.                          The same link still works: turn on auto admit if you are the one                          at the other end."
+                        "nobody answered the prompt here, so that viewer was not let in. The same link still works: turn on auto admit if you are the one at the other end."
                             .to_owned(),
                     );
                     session.set_phase(Phase::Waiting {
@@ -1137,7 +1137,7 @@ fn video_loop(
                     // program that had simply stopped working.
                     if !announced {
                         session.note(format!(
-                            "{e}. A minimised window cannot be captured: restore it,                              or pick another application."
+                            "{e}. A minimised window cannot be captured: restore it, or pick another application."
                         ));
                         announced = true;
                     }

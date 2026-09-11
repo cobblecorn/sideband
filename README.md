@@ -46,14 +46,21 @@ Run the script again after a rebuild to update the installed copy, or with
 `-Uninstall` to take it back off. No administrator rights, nothing written outside
 your own profile.
 
-**Sharing on your own network needs one firewall rule.** Windows blocks inbound
-connections to programs it has no rule for, and it does so silently: the server
-starts, the link looks perfectly normal, and the other device simply cannot reach
-it. What you see is a window waiting for a viewer that never arrives. Rules are
-per executable path, so one made while running from `target/release` says nothing
-about the installed copy. Run the installer from an administrator PowerShell and
-it adds the rule; run it as yourself and it prints the one line to run. Sharing by
-code through a relay needs none of this.
+**The installer asks Windows for one permission, once.** The video arrives at
+this machine as an inbound connection, and Windows silently drops inbound
+traffic for programs it has no rule for. Viewers far away usually get through
+anyway, because this end knows their public address and contacts them first.
+Laptops and phones on the same network do not: browsers hide their local
+address, so their attempt arrives unannounced and is dropped, and the window
+waits for a viewer that never arrives. Measured, a laptop on the same network
+could not connect to the installed copy and connected at once to an identical
+copy that had the rule.
+
+So the installer adds it, for your home network only, behind a single Windows
+prompt. Everything else it does runs as you. Rules are per executable path, so
+one made while running from `target/release` says nothing about the installed
+copy, which is why installing can appear to break something that worked.
+Nothing is ever needed on the viewer's side.
 
 **A minimised window cannot be captured.** Windows.Graphics.Capture delivers
 nothing at all while a window is minimised, so the viewer gets sound and no

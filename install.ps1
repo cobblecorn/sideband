@@ -74,41 +74,71 @@ foreach ($path in @($start, $desktop)) {
 
 # Windows Firewall, and the reason this section exists at all.
 #
-# Sharing on your own network means a browser on another device opening a page
-# this program serves. That is an inbound connection, and Windows blocks
-# inbound connections to programs it has no rule for. It does so silently: the
-# server starts, the link is generated and looks perfectly normal, and the
-# other device simply cannot reach it. What you see is "waiting for a viewer"
-# for ever.
+# The video itself arrives at this machine as an inbound connection, whichever
+# way the two ends were introduced, by code or by local link. Windows drops
+# inbound traffic for any program it has no rule for, and it does so silently:
+# the code is issued, the viewer opens the link, and then nothing, with this
+# end waiting for a viewer who cannot reach it.
+#
+# It depends on the viewer. Somebody far away usually gets through without a
+# rule, because this end knows their real public address and contacts them
+# first, and Windows lets the reply in. A laptop or phone on the same network
+# is different: browsers hide their local address behind a random .local name,
+# so this end cannot contact them first, their attempt arrives unannounced,
+# and it is dropped. Measured: a laptop on the same network could not connect
+# to the installed copy, and connected at once to an identical copy that had a
+# rule.
 #
 # Rules are per executable path, which is the trap. A rule created while
 # running from `target\release` says nothing about the copy installed here, so
 # moving from one to the other loses it without any sign that anything changed.
+#
+# Private networks only. That is your home network; a cafe's Wi-Fi is Public,
+# and a screen sharing program has no business accepting connections there
+# unless you decide otherwise.
 $rule_name = "Sideband"
-$existing = Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue |
-    Where-Object { $_.Program -eq $installed }
+$has_rule = {
+    [bool](Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue |
+        Where-Object { $_.Program -eq $installed })
+}
 
-if ($existing) {
-    $firewall = "already allowed through the firewall"
+$admin = ([Security.Principal.WindowsPrincipal] `
+    [Security.Principal.WindowsIdentity]::GetCurrent()
+).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+$add_rule = "New-NetFirewallRule -DisplayName '$rule_name' -Direction Inbound " +
+    "-Action Allow -Program '$installed' -Profile Private " +
+    "-Description 'Lets viewers on your home network reach Sideband' | Out-Null"
+
+if (& $has_rule) {
+    $firewall = "already allowed on your home network"
+} elseif ($admin) {
+    try {
+        Invoke-Expression $add_rule
+        $firewall = "allowed on your home network"
+    } catch {
+        $firewall = "NOT allowed: could not add the rule ($_)"
+    }
 } else {
-    $admin = ([Security.Principal.WindowsPrincipal] `
-        [Security.Principal.WindowsIdentity]::GetCurrent()
-    ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-    if ($admin) {
-        try {
-            New-NetFirewallRule -DisplayName $rule_name -Direction Inbound `
-                -Action Allow -Program $installed -Profile Private `
-                -Description "Sharing to a browser on your own network" | Out-Null
-            $firewall = "allowed through the firewall"
-        } catch {
-            $firewall = "could not add a firewall rule: $_"
-        }
+    # Everything else in this installer runs as you. This one step cannot:
+    # changing the firewall needs administrator rights, so Windows asks once,
+    # for this and nothing else. Declining leaves a working install that only
+    # viewers far away can reach.
+    ""
+    "  One Windows prompt is about to appear, asking to let Sideband through"
+    "  the firewall on your home network. Without it, laptops and phones on"
+    "  the same network as this machine cannot connect."
+    ""
+    try {
+        Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden `
+            -ArgumentList "-NoProfile", "-Command", $add_rule
+    } catch {
+        # Declining the prompt lands here.
+    }
+    if (& $has_rule) {
+        $firewall = "allowed on your home network"
     } else {
-        # Not fatal, and not something to elevate for on its own: sharing
-        # through a relay needs no inbound rule at all, so an install without
-        # this is still a working install for anyone not on your own network.
-        $firewall = "NOT allowed through the firewall yet, see below"
+        $firewall = "NOT allowed: the Windows prompt was declined"
     }
 }
 
@@ -120,18 +150,9 @@ if ($existing) {
 ""
 
 if ($firewall -like "NOT*") {
-    "  Sharing on your own network needs one firewall rule, and adding it"
-    "  needs administrator rights, which this installer does not ask for."
-    ""
-    "  Either run this installer again from an administrator PowerShell, or"
-    "  run this one line in one:"
-    ""
-    "    New-NetFirewallRule -DisplayName 'Sideband' -Direction Inbound ``"
-    "      -Action Allow -Program '$installed' -Profile Private"
-    ""
-    "  Without it, a browser on another device on your network cannot reach"
-    "  this machine and the window will wait for a viewer that never arrives."
-    "  Sharing by code through a relay is unaffected."
+    "  Viewers far away will still connect. Laptops and phones on the same"
+    "  network as this machine will not, until you run this installer again"
+    "  and say yes to the Windows prompt."
     ""
 }
 

@@ -421,7 +421,7 @@ fn open_failure(session: &Session, e: &windows::core::Error) -> String {
 
     if e.code() == windows::Win32::Foundation::E_ACCESSDENIED {
         format!(
-            "no audio from {what}: it is running as administrator.              Start Sideband as administrator too, or the viewer hears silence."
+            "no audio from {what}: it is running as administrator. Start Sideband as administrator too, or the viewer hears silence."
         )
     } else {
         format!("no audio from {what}: {e}")
