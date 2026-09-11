@@ -31,6 +31,18 @@ const NOTICE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(6);
 
 pub struct Session {
     phase: Mutex<Phase>,
+
+    /// The code and link most recently offered, kept after the phase moves on.
+    ///
+    /// They used to exist only inside `Phase::Waiting`, so the moment the
+    /// first viewer connected they were gone from the window. That was
+    /// harmless while a code admitted one person; it stopped being harmless
+    /// when a code admits everybody, because inviting a second viewer then
+    /// meant stopping and starting again to see the code.
+    share: Mutex<Option<(Option<String>, String)>>,
+
+    /// How many people are watching right now, for the read-out.
+    watching: AtomicU32,
     source: Mutex<(String, String)>,
     resolution: Mutex<String>,
 
@@ -108,6 +120,8 @@ impl Default for Session {
     fn default() -> Self {
         Self {
             phase: Mutex::new(Phase::Idle),
+            share: Mutex::new(None),
+            watching: AtomicU32::new(0),
             source: Mutex::new((String::new(), String::new())),
             resolution: Mutex::new(String::new()),
             selected: AtomicU32::new(0),
@@ -137,9 +151,28 @@ impl Session {
     }
 
     pub fn set_phase(&self, phase: Phase) {
+        // Remembered on the way through, so it outlives the phase it came in.
+        if let Phase::Waiting { code, link } = &phase
+            && let Ok(mut s) = self.share.lock()
+        {
+            *s = Some((code.clone(), link.clone()));
+        }
         if let Ok(mut p) = self.phase.lock() {
             *p = phase;
         }
+    }
+
+    /// The code (when there is a relay) and link last offered, if any.
+    pub fn share(&self) -> Option<(Option<String>, String)> {
+        self.share.lock().ok().and_then(|s| s.clone())
+    }
+
+    pub fn watching(&self) -> u32 {
+        self.watching.load(Ordering::Relaxed)
+    }
+
+    pub fn set_watching(&self, n: u32) {
+        self.watching.store(n, Ordering::Relaxed);
     }
 
     pub fn preparing(&self, what: &str) {
@@ -408,6 +441,26 @@ mod tests {
         s.note_video(500);
         s.note_audio();
         assert_eq!(s.counters(), (2, 1, 1500));
+    }
+
+    #[test]
+    fn the_code_and_link_outlive_the_waiting_phase() {
+        // The window reads them while live, so they must still be there once
+        // somebody has connected, which is exactly when inviting a second
+        // person becomes possible.
+        let s = Session::default();
+        assert_eq!(s.share(), None, "nothing offered yet");
+
+        s.set_phase(Phase::Waiting {
+            code: Some("ABC234".into()),
+            link: "https://relay.example/ABC234".into(),
+        });
+        s.set_phase(Phase::Live);
+
+        assert_eq!(
+            s.share(),
+            Some((Some("ABC234".into()), "https://relay.example/ABC234".into()))
+        );
     }
 
     #[test]

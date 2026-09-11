@@ -624,12 +624,42 @@ impl App {
         ui.label(RichText::new(detail).color(FAINT).size(10.0));
     }
 
-    fn zone_code(&mut self, ui: &mut egui::Ui, phase: Option<&Phase>) {
-        let code = match phase {
-            Some(Phase::Waiting { code: Some(c), .. }) => Some(c.clone()),
+    /// The code and link to hand out, whenever handing them out would work.
+    ///
+    /// While waiting they come from the phase itself. Once somebody is watching
+    /// through a relay they come from what the session remembered, because the
+    /// code carries on admitting people for as long as this is sharing: hiding
+    /// it the moment the first viewer arrived made a second one impossible to
+    /// invite without starting again. Serving on the local network admits one
+    /// viewer only, so nothing is offered there once they have connected.
+    fn shareable(&self, phase: Option<&Phase>) -> Option<(Option<String>, String)> {
+        match phase {
+            Some(Phase::Waiting { code, link }) => Some((code.clone(), link.clone())),
+            Some(Phase::Live) => self
+                .session
+                .as_ref()
+                .and_then(|s| s.share())
+                .filter(|(code, _)| code.is_some()),
             _ => None,
+        }
+    }
+
+    fn zone_code(&mut self, ui: &mut egui::Ui, phase: Option<&Phase>) {
+        let live = matches!(phase, Some(Phase::Live));
+        let code = self.shareable(phase).and_then(|(code, _)| code);
+
+        // The header already says live, so while somebody is watching this
+        // spot is better spent on the code than on repeating that, and the
+        // heading carries how many have come in on it.
+        let heading = match (&code, live) {
+            (Some(_), true) => {
+                let n = self.session.as_ref().map_or(0, |s| s.watching());
+                format!("CODE · {n} WATCHING")
+            }
+            (Some(_), false) => "CODE".to_owned(),
+            (None, _) => "SESSION".to_owned(),
         };
-        caption(ui, if code.is_some() { "CODE" } else { "SESSION" });
+        caption(ui, &heading);
 
         match (&code, phase) {
             (Some(c), _) => {
@@ -676,12 +706,28 @@ impl App {
     fn zone_link(&mut self, ui: &mut egui::Ui, phase: Option<&Phase>) {
         caption(ui, "SEND THEM THIS LINK");
 
-        let link = match phase {
-            Some(Phase::Waiting { link, .. }) => Some(link.clone()),
-            _ => None,
-        };
+        let live = matches!(phase, Some(Phase::Live));
+        let link = self.shareable(phase).map(|(_, link)| link);
 
         match link {
+            // Somebody is watching and more can join: the link stays, on one
+            // row with its copy button, so the meters below keep their place.
+            // Those meters are how anyone tells a quiet game from a broken
+            // capture, and trading them for the link would only move the gap.
+            Some(link) if live => {
+                ui.horizontal(|ui| {
+                    if tiny(ui, "copy link").clicked() {
+                        ui.ctx().copy_text(link.clone());
+                    }
+                    ui.label(RichText::new(shorten_url(&link)).color(INK).size(10.0).monospace());
+                });
+                if let Some(sess) = self.session.clone() {
+                    ui.add_space(4.0);
+                    app_meter(ui, &sess);
+                    ui.add_space(3.0);
+                    mic_meter(ui, &sess);
+                }
+            }
             Some(link) => {
                 ui.label(RichText::new(shorten_url(&link)).color(INK).size(11.0).monospace());
                 ui.add_space(4.0);
@@ -693,14 +739,18 @@ impl App {
                         RichText::new(if self.relay.trim().is_empty() {
                             "same network only"
                         } else {
-                            "expires in 5 min"
+                            // Not a countdown any more: every new offer the
+                            // host publishes restarts the relay's clock, so
+                            // the code works for exactly as long as this is
+                            // sharing.
+                            "works while you share"
                         })
                         .color(FAINT)
                         .size(10.0),
                     );
                 });
             }
-            None if matches!(phase, Some(Phase::Live)) => {
+            None if live => {
                 if let Some(sess) = self.session.clone() {
                     ui.label(
                         RichText::new(format!("{:.0} audio pkt/s", self.rates.audio_pps))

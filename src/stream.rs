@@ -400,6 +400,7 @@ async fn relay_attempts(
             // Somebody left. With nobody watching this goes back to offering
             // and waiting; with others still connected it changes nothing.
             Some(finished) = watching.join_next(), if !watching.is_empty() => {
+                session.set_watching(watching.len() as u32);
                 if let Ok(Err(e)) = finished {
                     session.note(format!("{e}. The same code still works."));
                 }
@@ -419,6 +420,7 @@ async fn relay_attempts(
                             session.note("somebody else is watching too.".to_owned());
                         }
                         session.set_phase(Phase::Live);
+                        session.set_watching(already_watching as u32 + 1);
 
                         let session = Arc::clone(&session);
                         watching.spawn(async move {
