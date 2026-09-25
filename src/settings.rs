@@ -129,6 +129,11 @@ impl Settings {
         if std::env::var("SIDEBAND_NO_UPNP").is_ok_and(|v| truthy(&v)) {
             self.open_ports = false;
         }
+        // For a run that must not be heard: a test, or sharing from a machine
+        // somebody else is sitting at.
+        if std::env::var("SIDEBAND_QUIET").is_ok_and(|v| truthy(&v)) {
+            self.sounds = false;
+        }
     }
 
     /// Makes sure there is a permanent link to use, creating one the first

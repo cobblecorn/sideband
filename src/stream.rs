@@ -43,34 +43,32 @@ const CONTROL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Periodic keyframes, if any.
 ///
-/// `None`, and that is a measured decision rather than an omission. Forcing an
-/// IDR mid-stream against `rtc-rtp` 0.20.4 breaks decoding outright: measured
-/// on a 1080p60 game source, a 2-second IDR gave 9.7 fps decoded with 3.8
-/// picture-loss requests per second, while the identical stream with no
-/// periodic IDR gave 64 fps and zero. Two separate causes were fixed along the
-/// way, repeated parameter sets (see `encoder::strip_parameter_sets`) and a
-/// one-frame VBV budget, and neither accounted for it. The remaining fault is
-/// in how the library packetises a forced IDR, and a "safety net" that costs
-/// six sevenths of the frame rate is not a safety net.
+/// `None`, and now for a plainer reason than before: a keyframe costs twenty
+/// to fifty ordinary frames and nobody needs one on a schedule. They are sent
+/// when a viewer asks, which is when one is worth what it costs.
 ///
-/// Loss recovery does not depend on this, and no longer depends on being
-/// lucky either. Two mechanisms cover it:
-///
-///   * NACK, from the default interceptors, which buffer outgoing RTP and
-///     retransmit on request. This repairs the ordinary case.
-///   * Rolling intra refresh in the encoder, which repairs everything else.
-///     See `encoder::REFRESH_PERIOD`. A band of intra coded macroblocks
-///     sweeps the picture every couple of seconds, so a decoder in any state,
-///     however badly broken, converges on a correct picture within one cycle
-///     without a keyframe existing at all.
-///
-/// Measured with 15% of frames deliberately discarded, sustained: 25.5 fps
-/// decoded out of 30 sent, zero freezes, zero picture-loss requests, and one
-/// keyframe in the whole session, the one at the start. Before the refresh
-/// was turned on, that same loss broke the reference chain for good.
-///
-/// So this staying `None` is now a decision rather than a regret.
+/// This used to say that a forced IDR mid-stream could not survive the
+/// pipeline at all, on the strength of a measurement that was real: a
+/// two-second IDR gave 9.7 fps decoded with 3.8 picture-loss requests a
+/// second. The explanation attached to it was wrong. It blamed the library's
+/// payloader for repeating parameter sets, and the payloader does no such
+/// thing: it holds SPS and PPS back and emits them once, together, in front
+/// of the next picture. What it did do was write every packet of that
+/// keyframe to the socket back to back, because nothing in either library
+/// paces, so each answer to "I cannot decode" went out as a burst of hundreds
+/// of packets over the link that had just dropped something, produced more
+/// loss, and asked for another. See `net::PACE_FACTOR`, which is the fix, and
+/// `encoder::KEYFRAME_GAP`, which stops the same storm by limiting how often
+/// the answer can be a keyframe at all.
 const KEYFRAME_INTERVAL: Option<Duration> = None;
+
+/// The shortest gap between keyframes sent in answer to a viewer.
+///
+/// A browser that has lost its reference frames asks several times a second
+/// until it gets one, and every one of them is the same request. One answer a
+/// second repairs the picture about as fast as it can be repaired and costs a
+/// fraction of what answering each request would.
+const KEYFRAME_GAP: Duration = Duration::from_secs(1);
 
 /// Serve the viewer page ourselves. Nothing external is involved, which is why
 /// this is the right choice on a LAN or a tailnet.
@@ -1076,45 +1074,6 @@ fn trace_rate(feedback: &bwe::Feedback, target: bwe::Target) {
     );
 }
 
-/// Deliberately throws video away, to see what the viewer does about it.
-///
-/// `SIDEBAND_DROP` is a percentage, and while it is set that share of encoded
-/// frames is encoded and then not sent. Losing whole access units is a harsher
-/// version of what a bad link does to a stream, and it is the only way to
-/// answer the question this pipeline actually turns on: whether a viewer whose
-/// reference chain has been broken ever gets a correct picture back.
-///
-/// It is a test facility rather than a feature, but it lives here rather than
-/// in a branch, because "does it recover" is a question worth being able to
-/// ask again on any future change.
-struct Sabotage {
-    percent: u32,
-    counter: u64,
-}
-
-impl Sabotage {
-    fn from_env() -> Self {
-        let percent = std::env::var("SIDEBAND_DROP")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(0)
-            .min(100);
-        if percent > 0 {
-            eprintln!("  sabotage: dropping {percent}% of video frames");
-        }
-        Self { percent, counter: 0 }
-    }
-
-    /// Deterministic rather than random, so two runs are comparable.
-    fn should_drop(&mut self) -> bool {
-        if self.percent == 0 {
-            return false;
-        }
-        self.counter += 1;
-        (self.counter * self.percent as u64) % 100 < self.percent as u64
-    }
-}
-
 /// Capture, encode and send until the connection ends or a stop is requested.
 /// The capture, encode and audio pipeline, and the threads running it.
 ///
@@ -1291,8 +1250,6 @@ async fn run_media<P: webrtc::peer_connection::PeerConnection, N>(
     session: &Arc<Session>,
     joining: &mut mpsc::Receiver<N>,
 ) -> Served<N> {
-    let packet_duration = Duration::from_millis(20);
-    let mut sabotage = Sabotage::from_env();
     let started = Instant::now();
     let mut said_no_video = false;
     let mut ticker = tokio::time::interval(Duration::from_millis(200));
@@ -1303,30 +1260,20 @@ async fn run_media<P: webrtc::peer_connection::PeerConnection, N>(
             Some((au, ts)) = media.video_rx.recv() => {
                 // Sent whether or not the picture is hidden: hiding changes
                 // what is encoded, see `card`, never whether it is sent.
-                if !sabotage.should_drop() {
-                    let len = au.len();
-                    // The frame duration follows whatever cadence the rate
-                    // controller settled on, because it is what the RTP
-                    // timestamps are derived from: leaving it at 60ths of a
-                    // second while sending 30 tells the viewer to play
-                    // everything at double speed.
-                    let frame_duration =
-                        Duration::from_micros(1_000_000 / media.quality.get().fps.max(1) as u64);
-
-                    for viewer in viewers.iter() {
-                        // A send failing is that viewer's problem rather than
-                        // everyone's, so the rest carry on.
-                        let _ = viewer.net.send_video(&au, ts, frame_duration).await;
-                    }
-                    session.note_video(len);
+                let len = au.len();
+                for viewer in viewers.iter() {
+                    // A send failing is that viewer's problem rather than
+                    // everyone's, so the rest carry on. Sending is now handing
+                    // packets to that viewer's pacer, which is quick and does
+                    // not wait on their link, so one slow viewer no longer
+                    // holds up the others or the audio behind them.
+                    let _ = viewer.net.send_video(&au, ts).await;
                 }
+                session.note_video(len);
             }
             Some(packet) = media.audio_rx.recv() => {
                 for viewer in viewers.iter() {
-                    let _ = viewer
-                        .net
-                        .send_audio(&packet.data, packet.timestamp_us, packet_duration)
-                        .await;
+                    let _ = viewer.net.send_audio(&packet.data, packet.timestamp_us).await;
                 }
                 session.note_audio();
             }
@@ -1345,6 +1292,13 @@ async fn run_media<P: webrtc::peer_connection::PeerConnection, N>(
                     .unwrap_or_default();
                 let target = media.controller.update(&feedback);
                 media.quality.set(target);
+                // The pacer spends what the rate control decided, so it has to
+                // be told. Left at the opening figure it would either throttle
+                // a link that had earned more, or let a keyframe out in a
+                // burst on one that had not.
+                for viewer in viewers.iter() {
+                    viewer.net.set_pace_rate(target.bitrate);
+                }
                 trace_rate(&feedback, target);
             }
             // Somebody else has joined. The borrow of the viewer list has to
@@ -1709,11 +1663,28 @@ fn video_loop(
             if let Some(e) = enc.as_mut() {
                 // Serviced here rather than inside the encoder so the IDR
                 // lands on a real frame boundary.
+                // A real keyframe, which is the only thing that gets a
+                // browser decoding again after a gap it could not repair.
+                // Intra refresh, which this used to answer with instead,
+                // repairs a damaged picture but does not end the wait: the
+                // receiver in every browser holds everything back until a
+                // keyframe arrives, so the refresh was thrown away and the
+                // viewer stayed frozen until the window was resized and the
+                // encoder happened to be rebuilt.
                 if keyframe.take() || KEYFRAME_INTERVAL.is_some_and(|iv| last_idr.elapsed() >= iv) {
-                    e.request_keyframe();
-                    last_idr = Instant::now();
+                    if last_idr.elapsed() >= KEYFRAME_GAP {
+                        e.force_idr();
+                        last_idr = Instant::now();
+                    } else {
+                        // Too soon for another. A refresh cycle costs almost
+                        // nothing and repairs what it can in the meantime.
+                        e.request_keyframe();
+                    }
                 }
                 if let Some(au) = e.encode(&paced.frame, paced.timestamp_us)? {
+                    if encoder::is_keyframe(&au) {
+                        session.note_keyframe();
+                    }
                     if tx.blocking_send((au, paced.timestamp_us)).is_err() {
                         return Ok(()); // receiver gone; shutting down
                     }

@@ -121,6 +121,10 @@ pub struct Session {
     pub stop: AtomicBool,
 
     video_frames: AtomicU64,
+    /// Keyframes sent. They go out when a viewer asks and no more than one a
+    /// second, so this is small, and a viewer that froze while it climbs is a
+    /// different fault from one that froze while it does not move at all.
+    keyframes: AtomicU64,
     audio_packets: AtomicU64,
     video_bytes: AtomicU64,
 
@@ -201,6 +205,7 @@ impl Default for Session {
             reach: Mutex::new(None),
             stop: AtomicBool::new(false),
             video_frames: AtomicU64::new(0),
+            keyframes: AtomicU64::new(0),
             audio_packets: AtomicU64::new(0),
             video_bytes: AtomicU64::new(0),
             approval: Mutex::new(None),
@@ -437,6 +442,14 @@ impl Session {
 
     pub fn note_audio(&self) {
         self.audio_packets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_keyframe(&self) {
+        self.keyframes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn keyframes(&self) -> u64 {
+        self.keyframes.load(Ordering::Relaxed)
     }
 
     pub fn counters(&self) -> (u64, u64, u64) {

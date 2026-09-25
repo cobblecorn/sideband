@@ -6,7 +6,7 @@
 //! a staging texture so it can be written to disk as proof the capture works.
 //! Nothing downstream of stage 4 should ever do that.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 
 use windows::core::{Interface, Result};
@@ -18,9 +18,10 @@ use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Win32::Foundation::{HMODULE, HWND};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_FLAG,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::System::WinRT::Direct3D11::{
@@ -40,6 +41,18 @@ pub struct WindowCapture {
     /// bigger keeps producing frames at the old size until the pool is
     /// recreated, which looks exactly like the stream being stuck.
     size: Cell<(i32, i32)>,
+    /// Where each frame is copied to before anybody downstream sees it.
+    ///
+    /// The frame pool holds two buffers and hands them round: the texture a
+    /// frame arrives in goes back into rotation as soon as the frame is
+    /// released, and Windows writes the next picture into it whenever it
+    /// likes. Handing that texture straight to the encoder means the encoder
+    /// is reading a buffer somebody else may be writing, and the frame pacer
+    /// makes it worse by holding the last one to repeat while a still window
+    /// produces nothing new. One copy on the graphics card, which costs
+    /// nothing measurable and never touches the processor, makes the frame
+    /// ours for as long as we need it.
+    frame: RefCell<Option<ID3D11Texture2D>>,
 }
 
 impl WindowCapture {
@@ -106,6 +119,7 @@ impl WindowCapture {
                 item,
                 winrt_device,
                 size: Cell::new((start.Width, start.Height)),
+                frame: RefCell::new(None),
             })
         }
     }
@@ -177,12 +191,38 @@ impl WindowCapture {
 
         let surface = frame.Surface()?;
         let access: IDirect3DDxgiInterfaceAccess = surface.cast()?;
-        let texture: ID3D11Texture2D = unsafe { access.GetInterface()? };
+        let arrived: ID3D11Texture2D = unsafe { access.GetInterface()? };
 
         let mut desc = D3D11_TEXTURE2D_DESC::default();
-        unsafe { texture.GetDesc(&mut desc) };
+        unsafe { arrived.GetDesc(&mut desc) };
 
-        Ok(Some((texture, desc.Width, desc.Height)))
+        // Into a texture of our own, see `frame`. Rebuilt whenever the shape
+        // of what arrives changes, which is a window being resized.
+        let mut ours = self.frame.borrow_mut();
+        let matches = ours.as_ref().is_some_and(|t| {
+            let mut have = D3D11_TEXTURE2D_DESC::default();
+            unsafe { t.GetDesc(&mut have) };
+            (have.Width, have.Height, have.Format) == (desc.Width, desc.Height, desc.Format)
+        });
+        if !matches {
+            let wanted = D3D11_TEXTURE2D_DESC {
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_FLAG(D3D11_BIND_SHADER_RESOURCE.0).0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+                ..desc
+            };
+            let mut made: Option<ID3D11Texture2D> = None;
+            unsafe { self.device.CreateTexture2D(&wanted, None, Some(&mut made))? };
+            *ours = made;
+        }
+
+        let Some(copy) = ours.as_ref() else {
+            return Ok(None);
+        };
+        unsafe { self.context.CopyResource(copy, &arrived) };
+
+        Ok(Some((copy.clone(), desc.Width, desc.Height)))
     }
 
     /// Copies a GPU texture down to the CPU and writes a 32-bit BMP.

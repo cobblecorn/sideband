@@ -105,6 +105,11 @@ the window.
 the phone refuses to start the video with sound, the picture starts anyway with a
 **Tap for sound** button over it.
 
+**Press s on the viewer's page** for the numbers: picture size and frame rate,
+bitrate, packets lost, repairs asked for, keyframes, freezes and which decoder is
+doing the work. It is there so that "it froze" can be answered by somebody a
+hundred miles away without talking them through developer tools.
+
 There is a command line too, driving the same engine:
 
 ```
@@ -154,6 +159,23 @@ a chat application while both sounded normal in the room. Sent as captured, that
 is a viewer at full volume still straining to hear. Your microphone is mixed in
 afterwards at its own level, so a loud game never ducks your voice.
 
+**When a packet goes missing**, which on Wi-Fi it will, two things repair it.
+The viewer asks for the missing packet and it is sent again, which covers most
+of it. When that is not enough and their decoder gives up, it asks for a
+keyframe and gets one, at most one a second.
+
+That second half did not exist for a long time, and it is the likeliest
+explanation for a stream that froze and never came back until the shared window
+was resized: nothing connected a viewer's request to the encoder, so the
+request was counted, held the bitrate down, and was otherwise ignored. Resizing
+the window happened to build a new encoder, which opens with a keyframe, which
+is why that looked like a fix.
+
+Packets are also spaced out on the way to the network rather than written back
+to back. A keyframe is twenty to fifty times the size of an ordinary frame, and
+sent all at once it arrives as a burst that a home Wi-Fi link drops part of,
+which produces another request, which produces another burst.
+
 **Quality** - there is no quality setting, because the right one is a property of
 the viewer's connection and neither of you knows it. A session opens at 2.5 Mbit/s
 and 30 fps, low enough for almost any home link to carry from the first frame, and
@@ -187,6 +209,9 @@ it, not Sideband.
 
 When a stream misbehaves and you want to know why, `SIDEBAND_DEBUG_RATE=1` prints a
 line a second with what the viewer actually reported and what was decided from it.
+
+`SIDEBAND_QUIET=1` runs one session with no sounds, for sharing from a machine
+somebody else is sitting at.
 
 ---
 
@@ -428,13 +453,19 @@ quality doing nothing and nothing else would say so.
 cargo test
 ```
 
+**To break a stream on purpose**, set `SIDEBAND_DROP` to a percentage and that
+share of video packets is numbered, kept for retransmission, and then dropped on
+the way out. It imitates a bad link rather than punishing the stream: a packet
+lost on a wire was sent and can be sent again when the viewer asks, so the
+viewer's own repair machinery runs, which is the part worth testing. Watch it
+from the viewer's page with `s`.
+
 ## Known limits
 
 - **TURN has never fired.** Every connection so far has gone direct. The fallback is
   configured but unexercised, so carrier-grade NAT is still an open question.
-- **No periodic keyframes.** Forcing an IDR mid-stream against `rtc-rtp` 0.20.4
-  breaks decoding outright. That is measured, not assumed. Loss recovery relies on
-  NACK retransmission instead.
+- **No periodic keyframes**, because nobody needs one on a schedule. They are
+  sent when a viewer asks and at most one a second.
 - **Several people can watch the same link.** Each viewer gets its own encoder
   session, which is why: a viewer arriving late has no reference frame, the only
   thing that gives them one is a keyframe, and a forced keyframe does not survive
@@ -443,13 +474,21 @@ cargo test
   its own, which is the one case known to work, so everybody is a first viewer.
   The cost is an encode pass each; the gain is that each viewer also gets a rate
   fitted to their own connection rather than the worst one in the room.
-- **No keyframes after the first one.** Forcing one mid-stream does not survive
-  this pipeline, so recovery is rolling intra refresh instead: a band of the
-  picture is re-encoded from scratch every couple of seconds, and a decoder in
-  any state converges within one cycle. Measured with 15% of frames discarded on
-  purpose, sustained: every surviving frame decoded, no freezes, and no picture
-  requests. The visible cost is a faint band sweeping the picture once after
-  heavy loss.
+- **Packets are built and paced here, not by the library.** Both libraries
+  write every packet of a frame to the socket back to back, and the one this
+  pins ignores the timestamp handed to it: it builds RTP timestamps by adding
+  up the durations it is told, so every frame the pacer skipped put video
+  permanently further behind the audio. Sideband packetises, numbers, times
+  and paces its own packets, and stamps each one with the moment it left so
+  the viewer's bandwidth estimate has something true to work from.
+
+  Measured on the fixed pipeline with packets deliberately lost, sustained
+  over 50 seconds each: at 3% loss, 30 fps decoded with no freezes and no
+  picture requests; at 10% and at 30%, 20 fps decoded with no freezes, every
+  loss repaired by retransmission, and the rate control down where it should
+  be. The old test facility could not have shown any of this: it discarded
+  whole frames before they were packetised, so no sequence number was ever
+  missing and the viewer's browser never knew anything had gone.
 - **Resolution is the window's own, unless you set it.** `SIDEBAND_SCALE` gives
   half or quarter; anything in between would need a scaler with a shader in it
   rather than mipmap generation, for a difference nobody watching would notice.

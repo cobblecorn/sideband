@@ -55,8 +55,6 @@ pub struct NvencEncoder {
     /// A refresh cycle to begin on the next frame, because the viewer asked
     /// for a picture it could decode.
     pending_refresh: bool,
-    /// Whether SPS/PPS have been sent. See `strip_parameter_sets`.
-    sent_parameter_sets: bool,
     frames: u64,
 }
 
@@ -108,35 +106,17 @@ fn split_nals(au: &[u8]) -> Vec<(usize, usize)> {
     out
 }
 
-/// Removes SPS (7) and PPS (8) NAL units, keeping everything else.
+/// Whether an access unit carries a keyframe (an IDR picture, NAL type 5).
 ///
-/// NVENC repeats the parameter sets on every IDR, which is normally good
-/// practice. It is not good practice here: `rtc-rtp`'s H.264 payloader bundles
-/// SPS+PPS into a STAP-A and then falls through and emits the PPS a *second*
-/// time as a standalone NAL. The first keyframe survives that because the
-/// payloader's parameter-set state starts empty; every later one corrupts the
-/// stream, and the viewer's decoder stops decoding anything and asks for
-/// keyframes several times a second, which makes it worse, not better.
-///
-/// The receiver keeps the parameter sets it got from the first keyframe for
-/// the life of the session, so later IDRs decode without them. Each viewer
-/// gets its own session and therefore its own first keyframe.
-fn strip_parameter_sets(au: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(au.len());
-    for (start, end) in split_nals(au) {
-        // The NAL type is the low 5 bits of the byte after the start code.
+/// Worth counting rather than assuming. Keyframes are now sent in answer to a
+/// viewer that cannot decode, at most one a second, and "how many went out,
+/// and when" is the first question when somebody says their picture froze.
+pub fn is_keyframe(au: &[u8]) -> bool {
+    split_nals(au).into_iter().any(|(start, end)| {
+        // The NAL type is the low five bits of the byte after the start code.
         let header = au[start..end].iter().position(|&b| b == 1).map(|p| start + p + 1);
-        let Some(h) = header else { continue };
-        if h >= end {
-            continue;
-        }
-        let nal_type = au[h] & 0x1f;
-        if nal_type == 7 || nal_type == 8 {
-            continue;
-        }
-        out.extend_from_slice(&au[start..end]);
-    }
-    out
+        header.is_some_and(|h| h < end && au[h] & 0x1f == 5)
+    })
 }
 
 impl NvencEncoder {
@@ -173,7 +153,7 @@ impl NvencEncoder {
                 (ENCODE_API.get_encode_preset_config_ex)(
                     encoder,
                     NV_ENC_CODEC_H264_GUID,
-                    NV_ENC_PRESET_P1_GUID,
+                    NV_ENC_PRESET_P4_GUID,
                     NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
                     &mut preset,
                 ),
@@ -183,14 +163,24 @@ impl NvencEncoder {
             let mut config = Box::new(preset.presetCfg);
             config.version = NV_ENC_CONFIG_VER;
 
+            // Say which profile, rather than leaving the driver to pick one.
+            //
+            // The offer this stream is advertised with names a profile, and
+            // what is actually encoded has to be that profile: a viewer whose
+            // decoder trusts the offer and gets something else is entitled to
+            // refuse it, and phones do. High is what the offer says, see
+            // `net::H264_FMTP`, and it is also the one worth having: CABAC
+            // and 8x8 transforms are most of the picture quality per bit that
+            // separates a soft stream from a sharp one at the same rate.
+            config.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
+
             // No B-frames: they reorder output and add a frame of latency for
             // a compression win nobody watching a game will notice.
             config.frameIntervalP = 1;
 
-            // No periodic IDR, and none on demand either. See
-            // `stream::KEYFRAME_INTERVAL`: a forced IDR mid-stream does not
-            // survive this pipeline, so recovery is done with intra refresh
-            // instead, which is what the block below sets up.
+            // No keyframes on a schedule. They are sent when a viewer asks
+            // for one, at most one a second, see `stream::KEYFRAME_GAP`, and
+            // a keyframe nobody needed costs twenty to fifty ordinary frames.
             config.gopLength = NVENC_INFINITE_GOPLENGTH;
 
             // Rolling intra refresh, the reason a viewer can recover at all.
@@ -231,7 +221,7 @@ impl NvencEncoder {
             let mut init = Box::new(NV_ENC_INITIALIZE_PARAMS {
                 version: NV_ENC_INITIALIZE_PARAMS_VER,
                 encodeGUID: NV_ENC_CODEC_H264_GUID,
-                presetGUID: NV_ENC_PRESET_P1_GUID,
+                presetGUID: NV_ENC_PRESET_P4_GUID,
                 encodeWidth: width,
                 encodeHeight: height,
                 darWidth: width,
@@ -271,7 +261,6 @@ impl NvencEncoder {
                 // decode against.
                 pending_idr: true,
                 pending_refresh: false,
-                sent_parameter_sets: false,
                 frames: 0,
             })
         }
@@ -380,12 +369,16 @@ impl NvencEncoder {
                 lock.bitstreamSizeInBytes as usize,
             );
 
-            let bytes = if self.sent_parameter_sets {
-                strip_parameter_sets(raw)
-            } else {
-                self.sent_parameter_sets = true;
-                raw.to_vec()
-            };
+            // Everything the encoder produced, parameter sets included.
+            //
+            // They used to be stripped from every access unit after the
+            // first, to work around a payloader that was said to emit the PPS
+            // twice. It does not: it holds SPS and PPS back and emits them
+            // once, together, in front of the next picture, and it does that
+            // for every keyframe. Withholding them meant a keyframe could
+            // never carry a new resolution, and a viewer that lost the
+            // originals could never be given them again.
+            let bytes = raw.to_vec();
 
             check(
                 (ENCODE_API.unlock_bitstream)(self.encoder, self.bitstream),
@@ -405,14 +398,13 @@ impl NvencEncoder {
     ///
     /// The encoder keeps going: no IDR is forced and no state is reset, which
     /// is the whole point. Rebuilding the session instead would emit a fresh
-    /// keyframe, a burst of exactly the size a congested link cannot absorb,
-    /// sent at the moment congestion was detected, and would need new
-    /// parameter sets that `strip_parameter_sets` deliberately withholds.
+    /// keyframe at the moment congestion was detected, which is the worst
+    /// moment for one.
     ///
-    /// Resolution is not among the levers here, and cannot be until the
-    /// payloader bug that `strip_parameter_sets` works around is fixed: a new
-    /// resolution needs a new SPS, and this stream sends parameter sets
-    /// exactly once.
+    /// Resolution is not among the levers here. A new resolution needs a new
+    /// SPS, which means a keyframe, and changing the size of the picture
+    /// under a viewer is a thing this deliberately does not do: see the note
+    /// on picture size in the README.
     ///
     /// A driver that refuses the change leaves the encoder running at its
     /// previous settings, which `bitrate` and `fps` continue to report
@@ -463,9 +455,12 @@ impl NvencEncoder {
     }
 
     /// The bitrate the encoder is running at, in bits per second.
-    /// Force a real IDR on the next frame. Test hook, see
-    /// .
-    #[allow(dead_code)]
+    /// Sends a real keyframe on the next frame.
+    ///
+    /// What a viewer asking for a picture is answered with, subject to the
+    /// once-a-second limit in `stream`. Nothing else repairs a receiver that
+    /// has given up: every browser holds decoding until a keyframe arrives,
+    /// whatever else is sent in the meantime.
     pub fn force_idr(&mut self) {
         self.pending_idr = true;
     }
@@ -491,14 +486,13 @@ impl VideoEncoder for NvencEncoder {
         self.encode(&frame.frame, frame.timestamp_us).map(|_| ())
     }
 
-    /// What to do when the viewer says it cannot decode.
+    /// Starts a refresh cycle: the cheap answer, for when a real keyframe
+    /// has just been sent and another would only add to the load.
     ///
-    /// Not an IDR. See `stream::KEYFRAME_INTERVAL` for the measurement: a
-    /// forced IDR mid-stream took a 64 fps stream down to 9.7 and produced
-    /// nearly four picture-loss requests a second, because the answer to
-    /// "I cannot decode" was a burst too big for the link that had just
-    /// dropped something. A refresh cycle repairs the same damage using
-    /// ordinary frames.
+    /// A band of intra coded macroblocks sweeps the picture over the next
+    /// few frames, which repairs a damaged picture without a keyframe's cost.
+    /// It does not, on its own, restart a receiver that has stopped decoding,
+    /// which is what `force_idr` is for.
     fn request_keyframe(&mut self) {
         self.pending_refresh = true;
     }
@@ -524,7 +518,7 @@ impl Drop for NvencEncoder {
 
 #[cfg(test)]
 mod tests {
-    use super::{split_nals, strip_parameter_sets};
+    use super::{is_keyframe, split_nals};
 
     fn nal(kind: u8, body: &[u8]) -> Vec<u8> {
         let mut v = vec![0, 0, 0, 1, kind];
@@ -547,35 +541,26 @@ mod tests {
     }
 
     #[test]
-    fn strips_sps_and_pps_but_keeps_the_slice() {
+    fn a_keyframe_is_recognised_behind_its_parameter_sets() {
+        // What NVENC actually emits for a keyframe: SPS, PPS, then the
+        // picture itself. Both of the first two must not be mistaken for one.
         let mut au = nal(0x67, b"sps");
         au.extend(nal(0x68, b"pps"));
         au.extend(nal(0x65, b"idr-slice"));
-
-        let out = strip_parameter_sets(&au);
-        assert_eq!(out, nal(0x65, b"idr-slice"));
+        assert!(is_keyframe(&au));
     }
 
     #[test]
-    fn leaves_a_plain_p_frame_untouched() {
-        let au = nal(0x41, b"p-frame");
-        assert_eq!(strip_parameter_sets(&au), au);
-    }
-
-    #[test]
-    fn keeps_sei_and_other_nal_types() {
-        let mut au = nal(0x67, b"sps");
-        au.extend(nal(0x06, b"sei"));
-        au.extend(nal(0x65, b"idr"));
-
-        let mut expected = nal(0x06, b"sei");
-        expected.extend(nal(0x65, b"idr"));
-        assert_eq!(strip_parameter_sets(&au), expected);
+    fn an_ordinary_frame_is_not_a_keyframe() {
+        assert!(!is_keyframe(&nal(0x41, b"p-frame")));
+        let mut parameters_only = nal(0x67, b"sps");
+        parameters_only.extend(nal(0x68, b"pps"));
+        assert!(!is_keyframe(&parameters_only));
     }
 
     #[test]
     fn empty_input_is_handled() {
-        assert!(strip_parameter_sets(&[]).is_empty());
+        assert!(!is_keyframe(&[]));
         assert!(split_nals(&[]).is_empty());
     }
 }

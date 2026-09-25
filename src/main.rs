@@ -634,7 +634,16 @@ where
                             0 | 1 => String::new(),
                             n => format!("  {n} watching"),
                         };
-                        println!("  {frames} video / {packets} audio sent{quality}{app}{mic}{hidden}{people}");
+                        // Keyframes are sent when a viewer asks and at most
+                        // one a second, so this number climbing is a viewer
+                        // struggling to decode, and it sitting still while
+                        // somebody says they are frozen means their requests
+                        // are not arriving at all.
+                        let keys = match session.keyframes() {
+                            0 => String::new(),
+                            n => format!("  {n} keyframes"),
+                        };
+                        println!("  {frames} video / {packets} audio sent{quality}{app}{mic}{hidden}{people}{keys}");
                     }
                 }
 

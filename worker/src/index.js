@@ -622,6 +622,11 @@ function page(prefill, room = "") {
   /* Over the picture, for the one case where a phone refused to start it
      with sound: tapping this is the gesture it was waiting for. */
   #unmute { position:fixed; left:50%; bottom:72px; transform:translateX(-50%); z-index:2; }
+  /* The numbers, for when somebody far away says it is not working and
+     nobody is going to talk them through opening developer tools. */
+  #stats { position:fixed; top:10px; left:10px; z-index:3; margin:0; padding:10px 12px;
+    background:rgba(20,24,29,.86); border:1px solid #2c333c; border-radius:4px;
+    color:#e4e9ee; font:11px/1.55 ui-monospace,Consolas,monospace; white-space:pre; }
   /* The attribute has to win over the display rules above, or a hidden
      button is still a visible one. */
   [hidden] { display:none !important; }
@@ -645,6 +650,7 @@ function page(prefill, room = "") {
   </div>
   <video id="v" autoplay playsinline controls></video>
   <button id="unmute" hidden>Tap for sound</button>
+  <pre id="stats" hidden></pre>
 </div>
 
 <script>
@@ -748,6 +754,67 @@ unmute.onclick = () => {
   video.play().catch(() => {});
   unmute.hidden = true;
 };
+
+// Press s for the numbers. What they mean, when a picture freezes:
+//   keyframes climbing and frames decoded stuck: it is waiting for a
+//     keyframe that is not arriving.
+//   lost and repairs climbing: the network is dropping packets.
+//   dropped climbing with a software decoder: this device cannot keep up.
+const statsEl = document.getElementById('stats');
+let showStats = false;
+let statsTimer = null;
+
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 's' && e.key !== 'S') return;
+  if (e.target === input) return;
+  showStats = !showStats;
+  statsEl.hidden = !showStats;
+  clearInterval(statsTimer);
+  if (showStats) {
+    readStats();
+    statsTimer = setInterval(readStats, 1000);
+  }
+});
+
+let lastStats = null;
+async function readStats() {
+  if (!window.pc) { statsEl.textContent = 'not connected'; return; }
+  let video = null, candidate = null;
+  try {
+    const report = await window.pc.getStats();
+    report.forEach((s) => {
+      if (s.type === 'inbound-rtp' && s.kind === 'video') video = s;
+      if (s.type === 'candidate-pair' && s.nominated) candidate = s;
+    });
+  } catch (_) {
+    return;
+  }
+  if (!video) { statsEl.textContent = 'no video yet'; return; }
+
+  const since = lastStats && video.timestamp > lastStats.timestamp
+    ? (video.timestamp - lastStats.timestamp) / 1000
+    : 0;
+  const per = (now, before) => (since ? ((now - before) / since).toFixed(1) : '-');
+  const kbps = since && lastStats
+    ? (((video.bytesReceived - lastStats.bytesReceived) * 8) / since / 1000).toFixed(0)
+    : '-';
+
+  const rows = [
+    ['picture', (video.frameWidth || 0) + 'x' + (video.frameHeight || 0) + '  ' + (video.framesPerSecond || 0) + ' fps'],
+    ['bitrate', kbps + ' kbit/s'],
+    ['decoded', video.framesDecoded + '  (+' + (lastStats ? per(video.framesDecoded, lastStats.framesDecoded) : '-') + '/s)'],
+    ['keyframes', video.keyFramesDecoded],
+    ['lost', video.packetsLost],
+    ['repairs asked', 'nack ' + video.nackCount + '  picture ' + video.pliCount],
+    ['dropped', video.framesDropped],
+    ['freezes', (video.freezeCount === undefined ? '-' : video.freezeCount) + '  ' + Math.round((video.totalFreezesDuration || 0) * 10) / 10 + 's'],
+    ['jitter', Math.round((video.jitter || 0) * 1000) + ' ms  buffer ' + Math.round((video.jitterBufferDelay / Math.max(video.jitterBufferEmittedCount, 1)) * 1000) + ' ms'],
+    ['decoder', video.decoderImplementation || '-'],
+    ['route', candidate ? (candidate.currentRoundTripTime * 1000).toFixed(0) + ' ms round trip' : '-'],
+  ];
+  lastStats = video;
+  statsEl.textContent = rows.map((r) => r[0].padEnd(15) + r[1]).join('\\n');
+}
 
 input.addEventListener('keydown', (e) => { if (e.key === 'Enter') button.click(); });
 button.onclick = () => {
@@ -914,6 +981,21 @@ async function attempt(code, onStatus) {
     if (video.srcObject !== e.streams[0]) {
       video.srcObject = e.streams[0];
       play();
+    }
+    // A little slack, for Wi-Fi.
+    //
+    // The browser holds arriving packets for a few tens of milliseconds
+    // before it has to decode them, and a retransmitted packet that arrives
+    // after that window is wasted: the frame is already late, so the picture
+    // breaks anyway. A target of 150 ms is a delay nobody watching a game
+    // over the internet will notice, and it is long enough for a lost packet
+    // to be asked for and arrive before the frame it belongs to is due.
+    try {
+      for (const receiver of pc.getReceivers()) {
+        if ('jitterBufferTarget' in receiver) receiver.jitterBufferTarget = 150;
+      }
+    } catch (_) {
+      // Older browsers decide for themselves.
     }
   };
 

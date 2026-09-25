@@ -398,14 +398,32 @@ pub struct FeedbackWatcher<P> {
     /// broken reference chain, and folding the two together would let a
     /// healthy audio stream mask a video stream in trouble.
     video_ssrc: u32,
+    /// Raised when the viewer asks for a picture it can decode. The encode
+    /// loop services it, at most once a second, see `stream::KEYFRAME_GAP`.
+    keyframe: crate::net::KeyframeSignal,
 }
 
 impl<P> FeedbackWatcher<P> {
     /// A factory for `Registry::with`, together with the handle to read from.
-    pub fn layer(video_ssrc: u32) -> (impl FnOnce(P) -> FeedbackWatcher<P>, ViewerFeedback) {
+    /// `keyframe` is raised the moment a viewer says it cannot decode.
+    ///
+    /// Here rather than anywhere else because here is where the request
+    /// arrives. Nothing used to connect the two at all: these requests were
+    /// counted, used to hold the bitrate down, and otherwise dropped on the
+    /// floor, so the encoder was never told and a viewer that lost its
+    /// reference frames waited for a keyframe that was never coming. The only
+    /// cure was resizing or switching the shared window, which builds a new
+    /// encoder, which opens with a keyframe by accident.
+    pub fn layer(
+        video_ssrc: u32,
+        keyframe: crate::net::KeyframeSignal,
+    ) -> (impl FnOnce(P) -> FeedbackWatcher<P>, ViewerFeedback) {
         let feedback = ViewerFeedback::new();
         let handle = feedback.clone();
-        (move |inner| FeedbackWatcher { inner, feedback, video_ssrc }, handle)
+        (
+            move |inner| FeedbackWatcher { inner, feedback, video_ssrc, keyframe },
+            handle,
+        )
     }
 }
 
@@ -467,6 +485,7 @@ impl<P> FeedbackWatcher<P> {
             .is_some_and(|pli| pli.media_ssrc == self.video_ssrc)
         {
             self.feedback.note_picture_loss();
+            self.keyframe.request();
         }
 
         // A full intra request is a picture-loss request by another name, and
@@ -476,6 +495,7 @@ impl<P> FeedbackWatcher<P> {
             .is_some_and(|fir| fir.fir.iter().any(|e| e.ssrc == self.video_ssrc))
         {
             self.feedback.note_picture_loss();
+            self.keyframe.request();
         }
 
         if packet
@@ -750,9 +770,15 @@ impl Controller {
             None => {}
         }
 
-        if fb.picture_loss > 0 {
-            trouble = true;
-        }
+        // A request for a picture is not evidence about the link.
+        //
+        // It used to count as trouble and hold the rate where it was. That
+        // made sense while such a request could not be answered: it meant a
+        // decoder stuck for reasons nothing here could fix. Now it is
+        // answered with a keyframe, so it is an ordinary event in a recovery
+        // that is already under way, and treating it as congestion pinned
+        // struggling viewers at the rate they were at when they lost a packet.
+        // Loss and the receiver's own estimate, above, are the evidence.
 
         if trouble {
             self.calm = 0;
@@ -1382,17 +1408,40 @@ mod tests {
     }
 
     #[test]
-    fn picture_loss_stops_a_climb() {
+    fn asking_for_a_picture_no_longer_holds_the_rate_down() {
+        // A viewer that lost a packet asks for a keyframe, gets one, and
+        // carries on. Reading that as congestion left exactly the viewers who
+        // had just recovered stuck at the rate they were at when they broke.
         let mut c = Controller::new(START_BITRATE, 60);
         let climbed = keeping_up(&mut c, 2).bitrate;
 
-        let struggling = Feedback {
+        let asked = Feedback {
             loss: Some(0.0),
+            picture_loss: 3,
+            sent_bitrate: climbed,
+            receiver_estimate: Some(MAX_BITRATE),
+            ..Default::default()
+        };
+        assert!(
+            c.update(&asked).bitrate >= climbed,
+            "a clean report with a picture request is still a clean report"
+        );
+    }
+
+    #[test]
+    fn real_loss_still_pulls_the_rate_back() {
+        // The other half of the change above: dropping the picture request
+        // from the evidence must not drop actual loss with it.
+        let mut c = Controller::new(START_BITRATE, 60);
+        let climbed = keeping_up(&mut c, 2).bitrate;
+
+        let losing = Feedback {
+            loss: Some(0.08),
             picture_loss: 3,
             sent_bitrate: climbed,
             ..Default::default()
         };
-        assert_eq!(c.update(&struggling).bitrate, climbed, "a failing decoder gets no more bits");
+        assert!(c.update(&losing).bitrate < climbed, "loss still costs bitrate");
     }
 
     #[test]
